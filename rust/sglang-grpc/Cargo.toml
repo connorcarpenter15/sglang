@@ -14,6 +14,8 @@ pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.12", features = ["gzip", "transport"] }
 prost = "0.13"
+# Provides google.protobuf.Struct for the OpenEngine KvSessionRef.attributes_struct.
+prost-types = "0.13"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
