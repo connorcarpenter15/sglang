@@ -82,6 +82,27 @@ pub fn build_generate_dict(
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
     }
 
+    // LoRA adapter: SGLang selects a per-request adapter via top-level `lora_path`.
+    if !req.lora_name.is_empty() {
+        d.insert("lora_path".into(), serde_json::json!(req.lora_name));
+    }
+
+    // Logprobs: SGLang controls them with top-level GenerateReqInput fields.
+    if req.return_logprobs {
+        d.insert("return_logprob".into(), serde_json::json!(true));
+        if req.top_logprobs > 0 {
+            d.insert("top_logprobs_num".into(), serde_json::json!(req.top_logprobs));
+        }
+        // <0 means "engine default" (completion tokens only); only forward an
+        // explicit prompt offset.
+        if req.logprob_start_len >= 0 {
+            d.insert(
+                "logprob_start_len".into(),
+                serde_json::json!(req.logprob_start_len),
+            );
+        }
+    }
+
     // Disaggregation: forward the bootstrap triple from kv_session to SGLang.
     // SGLang's Bootstrap path sends the router-assigned room to BOTH prefill and
     // decode; the Completed path sends it to decode only. Apply for any role.
@@ -143,6 +164,28 @@ fn sampling_params_to_map(req: &pb::GenerateRequest, role: Role) -> serde_json::
     }
     if !stop_token_ids.is_empty() {
         map.insert("stop_token_ids".into(), serde_json::json!(stop_token_ids));
+    }
+
+    // Guided / constrained decoding -> SGLang sampling_params grammar fields.
+    // SGLang's grammar backend (xgrammar by default) enforces these during
+    // sampling. At most one guide is set on the wire.
+    if let Some(guided) = &req.guided {
+        if let Some(guide) = &guided.guide {
+            match guide {
+                pb::guided_decoding::Guide::JsonSchema(s) => {
+                    map.insert("json_schema".into(), serde_json::json!(s));
+                }
+                pb::guided_decoding::Guide::Regex(s) => {
+                    map.insert("regex".into(), serde_json::json!(s));
+                }
+                pb::guided_decoding::Guide::EbnfGrammar(s) => {
+                    map.insert("ebnf".into(), serde_json::json!(s));
+                }
+                pb::guided_decoding::Guide::StructuralTag(s) => {
+                    map.insert("structural_tag".into(), serde_json::json!(s));
+                }
+            }
+        }
     }
 
     serde_json::Value::Object(map)
@@ -275,6 +318,69 @@ pub fn disagg_params_from_meta(
 ) -> Option<serde_json::Value> {
     let raw = meta.get("disaggregated_params")?;
     serde_json::from_str(raw).ok()
+}
+
+/// Parse the per-chunk logprobs the RuntimeHandle injected into `meta_info`
+/// (`oe_token_logprobs` = chosen, `oe_top_logprobs` = top-K) into OpenEngine
+/// proto types. SGLang entries are `[logprob, token_id, token_text?]`. Returns
+/// `(chosen, top)` aligned 1:1 with this chunk's `token_ids`; both empty when
+/// logprobs were not requested.
+pub fn token_logprobs_from_meta(
+    meta: &HashMap<String, String>,
+) -> (Vec<pb::LogProb>, Vec<pb::TopLogprobs>) {
+    let chosen = meta
+        .get("oe_token_logprobs")
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+        .map(|arr| arr.iter().map(|e| logprob_from_entry(e, 0)).collect())
+        .unwrap_or_default();
+
+    let top = meta
+        .get("oe_top_logprobs")
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+        .map(|arr| {
+            arr.iter()
+                .map(|per_token| {
+                    // SGLang emits `null` for positions with no top-k payload.
+                    let entries = per_token
+                        .as_array()
+                        .map(|alts| {
+                            alts.iter()
+                                .enumerate()
+                                .map(|(rank, e)| logprob_from_entry(e, rank as u32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    pb::TopLogprobs { entries }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (chosen, top)
+}
+
+/// One SGLang logprob entry `[logprob, token_id, token_text?]` -> proto LogProb.
+fn logprob_from_entry(entry: &serde_json::Value, rank: u32) -> pb::LogProb {
+    let arr = entry.as_array();
+    let logprob = arr
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let token_id = arr
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let token = arr
+        .and_then(|a| a.get(2))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    pb::LogProb {
+        token_id,
+        logprob,
+        token,
+        rank,
+    }
 }
 
 /// Map SGLang's `meta_info.finish_reason` to an OpenEngine `FinishReason`.

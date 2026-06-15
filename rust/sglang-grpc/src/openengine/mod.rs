@@ -119,13 +119,20 @@ fn parse_zmq_endpoint(endpoint: &str) -> Option<pb::KvEndpoint> {
 }
 
 /// Build a `pb::GenerateResponse` carrying a single token event.
-fn token_response(request_id: &str, token_ids: Vec<u32>, text: String) -> pb::GenerateResponse {
+fn token_response(
+    request_id: &str,
+    token_ids: Vec<u32>,
+    text: String,
+    logprobs: Vec<pb::LogProb>,
+    top_logprobs: Vec<pb::TopLogprobs>,
+) -> pb::GenerateResponse {
     pb::GenerateResponse {
         request_id: request_id.to_string(),
         event: Some(pb::generate_response::Event::Token(pb::TokenOutput {
             token_ids,
             text,
-            logprobs: Vec::new(),
+            logprobs,
+            top_logprobs,
         })),
         usage: None,
     }
@@ -218,7 +225,10 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
                             .into_iter()
                             .map(|t| t as u32)
                             .collect();
-                        yield Ok(token_response(&rid_clone, toks, data.text.unwrap_or_default()));
+                        let (logprobs, top_logprobs) =
+                            convert::token_logprobs_from_meta(&data.meta_info);
+                        let text = data.text.unwrap_or_default();
+                        yield Ok(token_response(&rid_clone, toks, text, logprobs, top_logprobs));
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
                         abort_guard.disarm();
@@ -253,7 +263,15 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
                             .map(|t| t as u32)
                             .collect();
                         if !final_toks.is_empty() {
-                            yield Ok(token_response(&rid_clone, final_toks, String::new()));
+                            let (logprobs, top_logprobs) =
+                                convert::token_logprobs_from_meta(&data.meta_info);
+                            yield Ok(token_response(
+                                &rid_clone,
+                                final_toks,
+                                String::new(),
+                                logprobs,
+                                top_logprobs,
+                            ));
                         }
                         let usage = convert::usage_from_meta(&data.meta_info);
                         let reason = convert::finish_reason_from_meta(&data.meta_info);
@@ -378,6 +396,11 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
             supports_guided_decoding: true,
             supports_lora: false,
             supports_multimodal: json_u64(&info, "is_multimodal") != 0,
+            // Response parser names the frontend applies to this model's output
+            // (tool-call extraction, reasoning separation). Empty when the engine
+            // was launched without --tool-call-parser / --reasoning-parser.
+            reasoning_parser: json_str(&info, "reasoning_parser"),
+            tool_call_parser: json_str(&info, "tool_call_parser"),
         }))
     }
 

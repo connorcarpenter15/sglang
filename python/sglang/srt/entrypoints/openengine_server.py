@@ -42,6 +42,7 @@ _GENERATE_REQ_KEYS = frozenset(
         "return_logprob",
         "top_logprobs_num",
         "logprob_start_len",
+        "lora_path",
     }
 )
 
@@ -54,6 +55,11 @@ class RuntimeHandle:
         self.engine = engine
         self.tokenizer_manager = engine.tokenizer_manager
         self.server_args = engine.server_args
+        # Point-in-time load, refreshed from the scheduler's per-batch ``load``
+        # piggyback (see GetLoad). Total token budget is fixed at startup.
+        self._running_reqs = 0
+        self._waiting_reqs = 0
+        self._max_total_tokens = self._compute_max_total_tokens()
         # Disaggregation: prefill workers advertise a bootstrap host/port and mint
         # a per-request room; the decode peer connects to it. Resolved once here.
         self.role = getattr(self.server_args, "disaggregation_mode", "null") or "null"
@@ -133,13 +139,30 @@ class RuntimeHandle:
             sent = 0
             async for out in gen:
                 meta = out.get("meta_info", {}) or {}
+                # Scheduler piggybacks per-DP-rank load on each chunk; cache the
+                # latest so GetLoad can report a real running/waiting count.
+                if "num_running_reqs" in meta:
+                    self._running_reqs = meta["num_running_reqs"] or 0
+                if "num_waiting_reqs" in meta:
+                    self._waiting_reqs = meta["num_waiting_reqs"] or 0
                 finished = bool(meta.get("finish_reason"))
                 full_ids = out.get("output_ids", []) or []
                 new_ids = full_ids[sent:]
+                # SGLang streams logprobs cumulatively too (output_token_logprobs
+                # / output_top_logprobs align 1:1 with output_ids); de-cumulate
+                # with the same pre-update `sent` index so each chunk carries only
+                # its new tokens' logprobs.
+                new_token_lp = (meta.get("output_token_logprobs") or [])[sent:]
+                new_top_lp = (meta.get("output_top_logprobs") or [])[sent:]
                 sent = len(full_ids)
+                # Copy before mutating; the original meta is the engine's.
+                meta = dict(meta)
                 if finished and disagg is not None:
-                    meta = dict(meta)
                     meta["disaggregated_params"] = disagg
+                if new_token_lp:
+                    meta["oe_token_logprobs"] = new_token_lp
+                if new_top_lp:
+                    meta["oe_top_logprobs"] = new_top_lp
                 chunk = {
                     "output_ids": new_ids,
                     "text": "",
@@ -163,20 +186,23 @@ class RuntimeHandle:
 
     # --- info / control ---------------------------------------------------
 
+    def _compute_max_total_tokens(self) -> int:
+        """Total KV token budget from the scheduler init result (0 if unknown)."""
+        sched = getattr(self.engine, "_scheduler_init_result", None)
+        infos = getattr(sched, "scheduler_infos", None) if sched is not None else None
+        if infos:
+            try:
+                return int(infos[0].get("max_total_num_tokens", 0) or 0)
+            except Exception:  # noqa: BLE001
+                return 0
+        return 0
+
     def get_model_info(self) -> str:
         sa = self.server_args
         is_mm = bool(getattr(self.tokenizer_manager, "mm_processor", None))
         page_size = int(getattr(sa, "page_size", 0) or 0)
         # KV capacity for the router: total token budget / page size.
-        max_total_tokens = 0
-        sched = getattr(self.engine, "_scheduler_init_result", None)
-        infos = getattr(sched, "scheduler_infos", None) if sched is not None else None
-        if infos:
-            try:
-                max_total_tokens = int(infos[0].get("max_total_num_tokens", 0) or 0)
-            except Exception:  # noqa: BLE001
-                max_total_tokens = 0
-        total_kv_blocks = (max_total_tokens // page_size) if page_size else 0
+        total_kv_blocks = (self._max_total_tokens // page_size) if page_size else 0
         return json.dumps(
             {
                 "model_path": sa.model_path,
@@ -187,6 +213,12 @@ class RuntimeHandle:
                 "total_kv_blocks": total_kv_blocks,
                 "max_running_requests": int(getattr(sa, "max_running_requests", 0) or 0),
                 "max_prefill_tokens": int(getattr(sa, "max_prefill_tokens", 0) or 0),
+                # Response parser names the frontend applies to this model's
+                # output (tool-call / reasoning). Configured on the engine via
+                # --tool-call-parser / --reasoning-parser; discovered here so the
+                # sidecar stays endpoint-only.
+                "reasoning_parser": getattr(sa, "reasoning_parser", None) or "",
+                "tool_call_parser": getattr(sa, "tool_call_parser", None) or "",
             }
         )
 
@@ -247,9 +279,25 @@ class RuntimeHandle:
         return True
 
     def get_load(self, callback, dp_rank):
-        # Best-effort point-in-time load. Refined later; for now report idle.
+        # Real point-in-time load. running/waiting come from the scheduler's
+        # per-batch ``load`` piggyback cached in _drive; self-correct to idle
+        # when the TokenizerManager has no in-flight requests. (used_tokens is
+        # not exposed by SGLang on this path, so it stays 0 — full KV-capacity
+        # load reporting to the router needs the snapshot-publisher path.)
+        try:
+            in_flight = len(self.tokenizer_manager.rid_to_state)
+        except Exception:  # noqa: BLE001
+            in_flight = 0
+        if in_flight == 0:
+            self._running_reqs = 0
+            self._waiting_reqs = 0
         payload = json.dumps(
-            {"num_running_reqs": 0, "num_waiting_reqs": 0, "num_used_tokens": 0}
+            {
+                "num_running_reqs": self._running_reqs,
+                "num_waiting_reqs": self._waiting_reqs,
+                "num_used_tokens": 0,
+                "max_total_num_tokens": self._max_total_tokens,
+            }
         ).encode()
         try:
             callback(payload, True, None)
