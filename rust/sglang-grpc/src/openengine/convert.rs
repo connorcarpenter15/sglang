@@ -202,12 +202,27 @@ fn decode_bootstrap_from_session(
     let attrs = session.attributes_struct.as_ref()?;
     let host = struct_get_str(attrs, "bootstrap_host")?;
     let port = struct_get_i64(attrs, "bootstrap_port")?;
-    let room = struct_get_i64(attrs, "bootstrap_room")?;
+    let room = struct_get_room(attrs, "bootstrap_room")?;
     Some(vec![
         ("bootstrap_host".into(), serde_json::json!(host)),
         ("bootstrap_port".into(), serde_json::json!(port)),
         ("bootstrap_room".into(), serde_json::json!(room)),
     ])
+}
+
+/// Bootstrap room: the Dynamo PrefillRouter mints a full u64, carried as a STRING
+/// by the sidecar to avoid f64/i64 precision loss. Parse as u64 and mask to 63
+/// bits so it fits SGLang's room range (`randint(0, 2**63-1)`). Applied
+/// identically for prefill + decode so the `(host, port, room)` keys match
+/// (a NumberValue fallback keeps older senders working).
+fn struct_get_room(s: &prost_types::Struct, key: &str) -> Option<i64> {
+    const MASK: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+    let room_u64 = match s.fields.get(key).and_then(|v| v.kind.as_ref())? {
+        prost_types::value::Kind::StringValue(v) => v.parse::<u64>().ok()?,
+        prost_types::value::Kind::NumberValue(n) => *n as u64,
+        _ => return None,
+    };
+    Some((room_u64 & MASK) as i64)
 }
 
 fn struct_get_str(s: &prost_types::Struct, key: &str) -> Option<String> {
