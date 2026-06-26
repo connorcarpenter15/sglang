@@ -524,9 +524,12 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
                 if endpoint.is_empty() {
                     continue;
                 }
+                let Some(endpoint_addr) = parse_zmq_endpoint(&endpoint) else {
+                    continue;
+                };
                 sources.push(pb::KvEventSource {
                     transport: "zmq".to_string(),
-                    endpoint: endpoint.clone(),
+                    endpoint_addr: Some(endpoint_addr),
                     topic: json_str(s, "topic"),
                     replay_endpoint: String::new(),
                     data_parallel_rank: s
@@ -538,7 +541,6 @@ impl pb::open_engine_server::OpenEngine for OpenEngineServiceImpl {
                     buffer_steps: 0,
                     hwm: 0,
                     max_queue_size: 0,
-                    endpoint_addr: parse_zmq_endpoint(&endpoint),
                 });
             }
         }

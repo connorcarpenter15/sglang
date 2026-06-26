@@ -288,7 +288,6 @@ pub fn prefill_kv_session(request_id: &str, disagg: &serde_json::Value) -> pb::K
         transfer_backend: backend,
         endpoints: Vec::new(),
         dp_rank: 0,
-        attributes: std::collections::HashMap::new(),
         attributes_struct: json_to_prost_struct(disagg),
     }
 }
