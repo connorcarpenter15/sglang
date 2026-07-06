@@ -26,6 +26,12 @@ def run_server(server_args):
             from sglang.srt.disaggregation.encode_server import launch_server
 
             launch_server(server_args)
+    elif server_args.openengine_port is not None:
+        # OpenEngine v1 gRPC server (Dynamo sidecar mode). Mounts the
+        # vendor-neutral OpenEngine service bridged to the scheduler; blocks.
+        from sglang.srt.entrypoints.openengine_server import serve_openengine
+
+        serve_openengine(server_args)
     elif server_args.grpc_mode:
         # TODO: Once the native Rust gRPC server starts alongside HTTP in the
         # default path below (controlled by SGLANG_ENABLE_GRPC / SGLANG_GRPC_PORT),

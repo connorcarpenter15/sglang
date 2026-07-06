@@ -404,6 +404,13 @@ class ServerArgs:
     port: int = 30000
     fastapi_root_path: str = ""
     grpc_mode: bool = False
+    # OpenEngine v1 gRPC server (Dynamo sidecar mode). When openengine_port is
+    # set, the engine mounts the vendor-neutral OpenEngine service (consumed by
+    # a Dynamo sidecar) instead of the SGLang-native gRPC service. Role and
+    # capabilities are discovered over the wire — there are no role/topology
+    # flags here, only the transport bind address.
+    openengine_port: Optional[int] = None
+    openengine_host: Optional[str] = None
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
@@ -4868,6 +4875,20 @@ class ServerArgs:
             "--grpc-mode",
             action="store_true",
             help="If set, use gRPC server instead of HTTP server.",
+        )
+        parser.add_argument(
+            "--openengine-port",
+            type=int,
+            default=ServerArgs.openengine_port,
+            help="If set, mount the OpenEngine v1 gRPC server on this port "
+            "(Dynamo sidecar mode) instead of the SGLang-native gRPC service. "
+            "Engine role and capabilities are discovered over the wire.",
+        )
+        parser.add_argument(
+            "--openengine-host",
+            type=str,
+            default=ServerArgs.openengine_host,
+            help="Bind host for the OpenEngine gRPC server. Defaults to --host.",
         )
         parser.add_argument(
             "--skip-server-warmup",

@@ -1,10 +1,15 @@
 pub mod bridge;
+pub mod openengine;
 pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
+}
+
+pub mod openengine_proto {
+    tonic::include_proto!("openengine.v1");
 }
 
 use pyo3::prelude::*;
@@ -256,9 +261,123 @@ fn start_server(
     })
 }
 
+/// Start the OpenEngine v1 gRPC server in a background thread with its own
+/// Tokio runtime. Mirrors [`start_server`] but mounts the vendor-neutral
+/// OpenEngine service (consumed by the Dynamo SGLang sidecar) instead of the
+/// SGLang-native one. Shares the same `PyBridge` contract over `runtime_handle`.
+///
+/// The disaggregation role is discovered from `runtime_handle.get_server_info()`
+/// at startup — there is no role/topology flag.
+#[pyfunction]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
+fn start_openengine_server(
+    host: String,
+    port: u16,
+    runtime_handle: PyObject,
+    worker_threads: usize,
+    response_channel_capacity: usize,
+    response_timeout_secs: u64,
+) -> PyResult<GrpcServerHandle> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init();
+
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", e)))?;
+    let worker_threads = worker_threads.max(1);
+    let response_channel_capacity = if response_channel_capacity == 0 {
+        DEFAULT_RESPONSE_CHANNEL_CAPACITY
+    } else {
+        response_channel_capacity
+    };
+    let response_timeout_secs = if response_timeout_secs == 0 {
+        server::DEFAULT_RESPONSE_TIMEOUT_SECS
+    } else {
+        response_timeout_secs
+    };
+    let response_timeout = Duration::from_secs(response_timeout_secs);
+    let listener = TcpListener::bind(addr).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to bind OpenEngine server to {}: {}",
+            addr, e
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to configure OpenEngine listener for {}: {}",
+            addr, e
+        ))
+    })?;
+
+    let tokenizer_info = extract_tokenizer_info(&runtime_handle)?;
+    let rust_tokenizer = tokenizer_info.tokenizer_path.as_deref().and_then(|p| {
+        RustTokenizer::from_tokenizer_path(
+            p,
+            tokenizer_info.tokenizer_mode.as_deref(),
+            tokenizer_info.context_len,
+        )
+    });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("sglang-openengine-tokio")
+        .build()
+        .map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to build Tokio runtime for OpenEngine server: {}",
+                err
+            ))
+        })?;
+    let tokio_handle = rt.handle().clone();
+
+    let bridge = Arc::new(PyBridge::new(
+        runtime_handle,
+        rust_tokenizer,
+        tokenizer_info.context_len,
+        response_channel_capacity,
+        tokio_handle,
+    ));
+    let role = openengine::discover_role(&bridge);
+    tracing::info!(?role, "OpenEngine server discovered engine role");
+
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = shutdown.clone();
+    let bridge_clone = bridge.clone();
+
+    let join_handle = std::thread::Builder::new()
+        .name("sglang-openengine".to_string())
+        .spawn(move || {
+            if let Err(e) = rt.block_on(openengine::run_openengine_server(
+                listener,
+                bridge_clone,
+                role,
+                shutdown_clone,
+                response_timeout,
+            )) {
+                tracing::error!("OpenEngine server exited with error: {}", e);
+            }
+        })
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to spawn OpenEngine thread: {}",
+                e
+            ))
+        })?;
+
+    Ok(GrpcServerHandle {
+        shutdown,
+        join_handle: Some(join_handle),
+    })
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
+    m.add_function(wrap_pyfunction!(start_openengine_server, m)?)?;
     m.add_class::<GrpcServerHandle>()?;
     m.add_class::<ChunkSendStatus>()?;
     Ok(())
