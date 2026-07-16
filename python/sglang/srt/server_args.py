@@ -1017,6 +1017,14 @@ class ServerArgs:
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+    grpc_response_timeout_secs: A[
+        int,
+        "Maximum seconds between native gRPC response chunks.",
+    ] = 300
+    grpc_max_message_size: A[
+        int,
+        "Maximum encoded native gRPC request/response size in bytes.",
+    ] = 64 * 1024 * 1024
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -3139,6 +3147,10 @@ class ServerArgs:
                     "SGLANG_GRPC_WORKER_THREADS "
                     f"({self.grpc_worker_threads}) must be >= 1"
                 )
+            if self.grpc_response_timeout_secs < 1:
+                raise ValueError("--grpc-response-timeout-secs must be >= 1")
+            if self.grpc_max_message_size < 1:
+                raise ValueError("--grpc-max-message-size must be >= 1")
 
         # Native gRPC is incompatible with launch paths it doesn't wire into.
         # Legacy takes precedence over grpc_port, keeping re-runs idempotent.

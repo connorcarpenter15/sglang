@@ -333,6 +333,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    grpc_port: int | None = None
+    grpc_worker_threads: int = 4
+    grpc_response_timeout_secs: int = 1200
+    grpc_max_message_size: int = 64 * 1024 * 1024
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -935,6 +939,8 @@ class ServerArgs(DisaggServerArgsMixin):
             requested_ports = []
             if needs_http:
                 requested_ports.append((self.port, "HTTP"))
+                if self.grpc_port is not None:
+                    requested_ports.append((self.grpc_port, "gRPC"))
             requested_ports.append((self.scheduler_port, "Scheduler"))
             if self.master_port is not None:
                 requested_ports.append((self.master_port, "Master"))
@@ -952,6 +958,11 @@ class ServerArgs(DisaggServerArgsMixin):
             if needs_http:
                 self.port = self.settle_port(self.port)
                 settled_ports.add(self.port)
+                if self.grpc_port is not None:
+                    self.grpc_port = self.settle_port(
+                        self.grpc_port, avoid=settled_ports
+                    )
+                    settled_ports.add(self.grpc_port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
@@ -1737,6 +1748,30 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--grpc-port",
+            type=int,
+            default=ServerArgs.grpc_port,
+            help="Port for the native SGLang gRPC API. Disabled when unset.",
+        )
+        parser.add_argument(
+            "--grpc-worker-threads",
+            type=int,
+            default=ServerArgs.grpc_worker_threads,
+            help="Number of Tokio worker threads used by the native gRPC server.",
+        )
+        parser.add_argument(
+            "--grpc-response-timeout-secs",
+            type=int,
+            default=ServerArgs.grpc_response_timeout_secs,
+            help="Maximum time to wait for one native gRPC media response.",
+        )
+        parser.add_argument(
+            "--grpc-max-message-size",
+            type=int,
+            default=ServerArgs.grpc_max_message_size,
+            help="Maximum encoded native gRPC request/response size in bytes.",
         )
         parser.add_argument(
             "--strict-ports",

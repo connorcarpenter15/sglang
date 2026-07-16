@@ -7,6 +7,17 @@ pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
 }
 
+pub const PROTOCOL_REVISION: &str = "sglang.runtime.v1.full-parity.1";
+
+pub fn descriptor_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/sglang_descriptor.bin"
+    )));
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 use pyo3::prelude::*;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
@@ -91,16 +102,27 @@ fn try_get_attr_i32(
     })
 }
 
-fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> {
+fn extract_tokenizer_info(
+    runtime_handle: &PyObject,
+    require_tokenizer: bool,
+) -> PyResult<TokenizerInfo> {
     Python::with_gil(|py| {
-        let tm = runtime_handle
-            .getattr(py, "tokenizer_manager")
-            .map_err(|err| {
-                pyo3::exceptions::PyValueError::new_err(format!(
+        let tm = match runtime_handle.getattr(py, "tokenizer_manager") {
+            Ok(tm) => tm,
+            Err(err) if require_tokenizer => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "runtime_handle.tokenizer_manager is required: {}",
                     err
-                ))
-            })?;
+                )));
+            }
+            Err(_) => {
+                return Ok(TokenizerInfo {
+                    tokenizer_path: None,
+                    tokenizer_mode: None,
+                    context_len: 0,
+                });
+            }
+        };
 
         let server_args = try_get_attr(py, &tm, "server_args", "tokenizer_manager");
 
@@ -148,7 +170,7 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> 
 /// Returns:
 ///     GrpcServerHandle that can be used to shut down the server.
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300, require_tokenizer=true, max_message_size=None))]
 fn start_server(
     host: String,
     port: u16,
@@ -156,6 +178,8 @@ fn start_server(
     worker_threads: usize,
     response_channel_capacity: usize,
     response_timeout_secs: u64,
+    require_tokenizer: bool,
+    max_message_size: Option<usize>,
 ) -> PyResult<GrpcServerHandle> {
     // Best-effort: embedding processes may initialize tracing themselves.
     let _ = tracing_subscriber::fmt()
@@ -187,6 +211,17 @@ fn start_server(
         response_timeout_secs
     };
     let response_timeout = Duration::from_secs(response_timeout_secs);
+    let max_message_size = match max_message_size {
+        Some(value) if value > 0 => value,
+        Some(_) => {
+            tracing::warn!(
+                default = server::DEFAULT_GRPC_MAX_MESSAGE_SIZE,
+                "max_message_size must be positive; using default"
+            );
+            server::DEFAULT_GRPC_MAX_MESSAGE_SIZE
+        }
+        None => server::resolve_max_message_size(),
+    };
     let listener = TcpListener::bind(addr).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "Failed to bind gRPC server to {}: {}",
@@ -200,7 +235,7 @@ fn start_server(
         ))
     })?;
 
-    let tokenizer_info = extract_tokenizer_info(&runtime_handle)?;
+    let tokenizer_info = extract_tokenizer_info(&runtime_handle, require_tokenizer)?;
 
     let rust_tokenizer = tokenizer_info.tokenizer_path.as_deref().and_then(|p| {
         RustTokenizer::from_tokenizer_path(
@@ -242,6 +277,7 @@ fn start_server(
                 bridge_clone,
                 shutdown_clone,
                 response_timeout,
+                max_message_size,
             )) {
                 tracing::error!("gRPC server exited with error: {}", e);
             }

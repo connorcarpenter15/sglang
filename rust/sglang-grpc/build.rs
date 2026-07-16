@@ -12,5 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&[proto_path], &["../../proto"])?;
 
     println!("cargo:rerun-if-changed={}", proto_path);
+    println!(
+        "cargo:rerun-if-changed={}",
+        "../../proto/sglang/runtime/v1/SCHEMA.sha256"
+    );
     Ok(())
 }
