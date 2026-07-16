@@ -593,6 +593,17 @@ class RuntimeHandle:
         configured_token_match = isinstance(matched, int) and any(
             item.get("token_id") == matched for item in visibility.get("tokens", [])
         )
+        output_ids = chunk.get("output_ids", [])
+        if (
+            isinstance(matched, int)
+            and not configured_token_match
+            and isinstance(output_ids, list)
+            and output_ids[-1:] == [matched]
+        ):
+            # Guided decoding terminates with its internal grammar EOS token.
+            # It is a control marker, not generated output, and would otherwise
+            # obscure a string stop immediately before it.
+            self._trim_output_token_metadata(chunk, 1)
         if not configured_token_match:
             # Guided decoding may finish on the same suffix as a configured
             # stop condition while SGLang reports either no match or its
