@@ -143,6 +143,25 @@ def test_stop_visibility_is_independent_for_strings_and_tokens():
     assert visible_token["output_ids"] == [1, 2, 99]
 
 
+def test_stop_visibility_recovers_missing_match_from_terminal_output():
+    hidden_string = {
+        "text": "alphaEND",
+        "output_ids": [1, 2],
+        "meta_info": {"finish_reason": {"type": "stop", "matched": None}},
+    }
+    RuntimeHandle._apply_stop_visibility(
+        hidden_string,
+        {
+            "strings": [
+                {"value": "END", "include_in_output": False},
+                {"value": "D", "include_in_output": True},
+            ]
+        },
+    )
+    assert hidden_string["text"] == "alpha"
+    assert hidden_string["meta_info"]["finish_reason"]["matched"] == "END"
+
+
 @dataclass
 class _ServerArgs:
     model_path: str = "model"

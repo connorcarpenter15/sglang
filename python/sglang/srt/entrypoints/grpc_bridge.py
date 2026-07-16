@@ -504,6 +504,36 @@ class RuntimeHandle:
         if not isinstance(finish, dict) or finish.get("type") != "stop":
             return
         matched = finish.get("matched")
+        if matched is None:
+            # Guided decoding may finish on the same suffix as a configured
+            # stop condition while SGLang reports a grammar stop without the
+            # matched value. Recover the typed stop reason from the terminal
+            # output so per-stop visibility still applies.
+            text = chunk.get("text", "")
+            string_matches = [
+                item
+                for item in visibility.get("strings", [])
+                if item.get("value") and text.endswith(item["value"])
+            ]
+            if string_matches:
+                matched = max(string_matches, key=lambda item: len(item["value"]))[
+                    "value"
+                ]
+            else:
+                output_ids = chunk.get("output_ids", [])
+                if output_ids:
+                    matched_token = next(
+                        (
+                            item.get("token_id")
+                            for item in visibility.get("tokens", [])
+                            if item.get("token_id") == output_ids[-1]
+                        ),
+                        None,
+                    )
+                    if matched_token is not None:
+                        matched = matched_token
+            if matched is not None:
+                finish["matched"] = matched
         if isinstance(matched, int):
             visible = any(
                 item.get("token_id") == matched and item.get("include_in_output")
