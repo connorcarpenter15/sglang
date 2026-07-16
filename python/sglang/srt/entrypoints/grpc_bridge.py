@@ -497,6 +497,28 @@ class RuntimeHandle:
         await self._run_embed(obj, chunk_callback, request)
 
     @staticmethod
+    def _hold_back_hidden_stop_text(chunk: dict, visibility: Optional[dict]) -> None:
+        if not visibility or not isinstance(chunk.get("text"), str):
+            return
+        hidden_stops = [
+            item.get("value")
+            for item in visibility.get("strings", [])
+            if item.get("value") and not item.get("include_in_output")
+        ]
+        text = chunk["text"]
+        holdback = max(
+            (
+                prefix_length
+                for stop in hidden_stops
+                for prefix_length in range(1, len(stop) + 1)
+                if text.endswith(stop[:prefix_length])
+            ),
+            default=0,
+        )
+        if holdback:
+            chunk["text"] = text[:-holdback]
+
+    @staticmethod
     def _apply_stop_visibility(chunk: dict, visibility: Optional[dict]) -> None:
         if not visibility:
             return
@@ -504,11 +526,14 @@ class RuntimeHandle:
         if not isinstance(finish, dict) or finish.get("type") != "stop":
             return
         matched = finish.get("matched")
-        if matched is None:
+        configured_token_match = isinstance(matched, int) and any(
+            item.get("token_id") == matched for item in visibility.get("tokens", [])
+        )
+        if not configured_token_match:
             # Guided decoding may finish on the same suffix as a configured
-            # stop condition while SGLang reports a grammar stop without the
-            # matched value. Recover the typed stop reason from the terminal
-            # output so per-stop visibility still applies.
+            # stop condition while SGLang reports either no match or its
+            # grammar EOS token. Recover the typed stop reason from the
+            # terminal output so per-stop visibility still applies.
             text = chunk.get("text", "")
             string_matches = [
                 item
@@ -582,6 +607,8 @@ class RuntimeHandle:
                             return
                         terminal_choices.add(choice_index)
                         request_finished = len(terminal_choices) == expected_choices
+                    else:
+                        self._hold_back_hidden_stop_text(chunk, stop_visibility)
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,

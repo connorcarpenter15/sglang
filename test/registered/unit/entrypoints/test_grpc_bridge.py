@@ -147,7 +147,7 @@ def test_stop_visibility_recovers_missing_match_from_terminal_output():
     hidden_string = {
         "text": "alphaEND",
         "output_ids": [1, 2],
-        "meta_info": {"finish_reason": {"type": "stop", "matched": None}},
+        "meta_info": {"finish_reason": {"type": "stop", "matched": 151643}},
     }
     RuntimeHandle._apply_stop_visibility(
         hidden_string,
@@ -160,6 +160,17 @@ def test_stop_visibility_recovers_missing_match_from_terminal_output():
     )
     assert hidden_string["text"] == "alpha"
     assert hidden_string["meta_info"]["finish_reason"]["matched"] == "END"
+
+
+def test_hidden_stop_prefixes_are_held_back_before_terminal():
+    visibility = {"strings": [{"value": "END", "include_in_output": False}]}
+    partial = {"text": "alphaEN", "meta_info": {"finish_reason": None}}
+    RuntimeHandle._hold_back_hidden_stop_text(partial, visibility)
+    assert partial["text"] == "alpha"
+
+    diverged = {"text": "alphaENO", "meta_info": {"finish_reason": None}}
+    RuntimeHandle._hold_back_hidden_stop_text(diverged, visibility)
+    assert diverged["text"] == "alphaENO"
 
 
 @dataclass
