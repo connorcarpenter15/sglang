@@ -619,6 +619,17 @@ class RuntimeHandle:
                 matched = max(string_matches, key=lambda item: len(item["value"]))[
                     "value"
                 ]
+                output_ids = chunk.get("output_ids", [])
+                if isinstance(output_ids, list):
+                    # SGLang's finish metadata and the appended grammar marker
+                    # can use different internal token IDs. Locate the real
+                    # string-stop suffix through a short trailing control-token
+                    # suffix instead of depending on either internal ID.
+                    for control_tokens in range(1, min(4, len(output_ids)) + 1):
+                        candidate_ids = output_ids[:-control_tokens]
+                        if self._decoded_token_suffix_length(candidate_ids, matched):
+                            self._trim_output_token_metadata(chunk, control_tokens)
+                            break
             else:
                 output_ids = chunk.get("output_ids", [])
                 if output_ids:

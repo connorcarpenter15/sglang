@@ -159,7 +159,7 @@ def test_stop_visibility_recovers_missing_match_from_terminal_output():
     hidden_string = {
         "text": "alphaEND",
         "output_ids": [1, 36, 45, 35, 151645],
-        "meta_info": {"finish_reason": {"type": "stop", "matched": 151645}},
+        "meta_info": {"finish_reason": {"type": "stop", "matched": 151643}},
     }
     handle._apply_stop_visibility(
         hidden_string,
