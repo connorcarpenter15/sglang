@@ -15,7 +15,8 @@ use tonic::{Request, Response, Status};
 use crate::bridge::{PyBridge, ResponseChunk, ResponseData, TerminalError};
 use crate::proto;
 use crate::utils::{
-    build_classify_dict, build_embed_dict, build_generate_dict, extract_model_path,
+    build_classify_dict, build_embed_dict, build_generate_dict, embed_request_ids,
+    extract_model_path,
 };
 
 pub struct SglangServiceImpl {
@@ -86,15 +87,19 @@ async fn recv_chunk_with_timeout(
 
 struct RequestAbortGuard {
     bridge: Arc<PyBridge>,
-    rid: String,
+    rids: Vec<String>,
     armed: bool,
 }
 
 impl RequestAbortGuard {
     fn new(bridge: Arc<PyBridge>, rid: impl Into<String>) -> Self {
+        Self::new_many(bridge, vec![rid.into()])
+    }
+
+    fn new_many(bridge: Arc<PyBridge>, rids: Vec<String>) -> Self {
         Self {
             bridge,
-            rid: rid.into(),
+            rids,
             armed: true,
         }
     }
@@ -106,7 +111,9 @@ impl RequestAbortGuard {
     fn abort_now(&mut self) {
         if self.armed {
             self.armed = false;
-            spawn_abort(self.bridge.clone(), self.rid.clone());
+            for rid in self.rids.drain(..) {
+                spawn_abort(self.bridge.clone(), rid);
+            }
         }
     }
 }
@@ -116,7 +123,9 @@ impl Drop for RequestAbortGuard {
         if self.armed {
             // Dropping a response stream means the client stopped consuming; propagate
             // cancellation to Python without blocking the Tokio worker.
-            spawn_abort(self.bridge.clone(), self.rid.clone());
+            for rid in self.rids.drain(..) {
+                spawn_abort(self.bridge.clone(), rid);
+            }
         }
     }
 }
@@ -143,7 +152,24 @@ async fn recv_terminal_chunk_for_request(
     receiver: &mut Receiver<ResponseChunk>,
     response_timeout: Duration,
 ) -> Result<ResponseChunk, Status> {
-    let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid.to_string());
+    recv_terminal_chunk_for_request_ids(
+        bridge,
+        rid,
+        vec![rid.to_string()],
+        receiver,
+        response_timeout,
+    )
+    .await
+}
+
+async fn recv_terminal_chunk_for_request_ids(
+    bridge: &Arc<PyBridge>,
+    channel_rid: &str,
+    rids: Vec<String>,
+    receiver: &mut Receiver<ResponseChunk>,
+    response_timeout: Duration,
+) -> Result<ResponseChunk, Status> {
+    let mut abort_guard = RequestAbortGuard::new_many(bridge.clone(), rids);
 
     match recv_chunk_with_timeout(receiver, response_timeout, || {
         format!("Request timed out after {}s", response_timeout.as_secs())
@@ -152,7 +178,7 @@ async fn recv_terminal_chunk_for_request(
     {
         Ok(Some(ResponseChunk::Data(_))) => {
             tracing::warn!(
-                rid,
+                rid = channel_rid,
                 "Unary gRPC response received non-terminal Data chunk; expected Finished"
             );
             abort_guard.abort_now();
@@ -165,7 +191,7 @@ async fn recv_terminal_chunk_for_request(
             Ok(chunk)
         }
         Ok(None) => {
-            let (status, should_abort) = closed_stream_status(bridge, rid);
+            let (status, should_abort) = closed_stream_status(bridge, channel_rid);
             if should_abort {
                 abort_guard.abort_now();
             } else {
@@ -749,6 +775,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_embed_dict(&rid, &req).map_err(Status::invalid_argument)?;
+        let abort_rids = embed_request_ids(&rid, req.inputs.len());
         let encoding = req.encoding;
 
         let mut receiver = self
@@ -756,9 +783,10 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_request(&rid, "embed", req_dict)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
-        let chunk = recv_terminal_chunk_for_request(
+        let chunk = recv_terminal_chunk_for_request_ids(
             &self.bridge,
             &rid,
+            abort_rids,
             &mut receiver,
             self.response_timeout,
         )

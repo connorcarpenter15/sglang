@@ -539,6 +539,16 @@ pub(crate) fn build_generate_dict(
     Ok(request)
 }
 
+pub(crate) fn embed_request_ids(rid: &str, input_count: usize) -> Vec<String> {
+    if input_count == 1 {
+        vec![rid.to_string()]
+    } else {
+        (0..input_count)
+            .map(|index| format!("{rid}:{index}"))
+            .collect()
+    }
+}
+
 pub(crate) fn build_embed_dict(
     rid: &str,
     req: &proto::EmbedRequest,
@@ -567,17 +577,11 @@ pub(crate) fn build_embed_dict(
         }
     }
     let mut request = HashMap::new();
-    if req.inputs.len() == 1 {
-        request.insert("rid".into(), serde_json::json!(rid));
+    let request_ids = embed_request_ids(rid, req.inputs.len());
+    if request_ids.len() == 1 {
+        request.insert("rid".into(), serde_json::json!(request_ids[0]));
     } else {
-        request.insert(
-            "rid".into(),
-            serde_json::json!(
-                (0..req.inputs.len())
-                    .map(|index| format!("{rid}:{index}"))
-                    .collect::<Vec<_>>()
-            ),
-        );
+        request.insert("rid".into(), serde_json::json!(request_ids));
     }
     if !texts.is_empty() {
         request.insert("text".into(), serde_json::json!(texts));
