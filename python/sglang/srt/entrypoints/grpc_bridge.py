@@ -476,6 +476,7 @@ class RuntimeHandle:
 
         try:
             stop_visibility = req_dict.get("grpc_stop_visibility")
+            self._prepare_hidden_stop_token_ids(stop_visibility)
             req_dict = await self._materialize_grpc_request(req_dict)
             obj = GenerateReqInput(**req_dict)
         except Exception as exc:
@@ -497,26 +498,82 @@ class RuntimeHandle:
         await self._run_embed(obj, chunk_callback, request)
 
     @staticmethod
+    def _trim_output_token_metadata(chunk: dict, count: int) -> None:
+        if count <= 0:
+            return
+        output_ids = chunk.get("output_ids")
+        if isinstance(output_ids, list) and len(output_ids) >= count:
+            chunk["output_ids"] = output_ids[:-count]
+        meta_info = chunk.get("meta_info")
+        if not isinstance(meta_info, dict):
+            return
+        for key in ("output_token_logprobs", "output_top_logprobs"):
+            values = meta_info.get(key)
+            if isinstance(values, list) and len(values) >= count:
+                meta_info[key] = values[:-count]
+        output_logprobs = meta_info.get("output_token_logprobs")
+        if isinstance(output_logprobs, list):
+            meta_info["output_token_logprobs_length"] = len(output_logprobs)
+
+    def _prepare_hidden_stop_token_ids(self, visibility: Optional[dict]) -> None:
+        if not visibility:
+            return
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        encode = getattr(tokenizer, "encode", None)
+        if encode is None:
+            return
+        for item in visibility.get("strings", []):
+            value = item.get("value")
+            if not value or item.get("include_in_output"):
+                continue
+            try:
+                item["_token_ids"] = list(encode(value, add_special_tokens=False))
+            except Exception as exc:
+                logger.debug(
+                    "Could not tokenize hidden gRPC stop string of length %s: %s",
+                    len(value),
+                    exc,
+                )
+
+    @staticmethod
     def _hold_back_hidden_stop_text(chunk: dict, visibility: Optional[dict]) -> None:
-        if not visibility or not isinstance(chunk.get("text"), str):
+        if not visibility:
             return
         hidden_stops = [
             item.get("value")
             for item in visibility.get("strings", [])
             if item.get("value") and not item.get("include_in_output")
         ]
-        text = chunk["text"]
-        holdback = max(
+        text = chunk.get("text")
+        if isinstance(text, str):
+            holdback = max(
+                (
+                    prefix_length
+                    for stop in hidden_stops
+                    for prefix_length in range(1, len(stop) + 1)
+                    if text.endswith(stop[:prefix_length])
+                ),
+                default=0,
+            )
+            if holdback:
+                chunk["text"] = text[:-holdback]
+
+        output_ids = chunk.get("output_ids")
+        if not isinstance(output_ids, list):
+            return
+        token_holdback = max(
             (
                 prefix_length
-                for stop in hidden_stops
-                for prefix_length in range(1, len(stop) + 1)
-                if text.endswith(stop[:prefix_length])
+                for item in visibility.get("strings", [])
+                if not item.get("include_in_output")
+                for token_ids in [item.get("_token_ids")]
+                if token_ids
+                for prefix_length in range(1, len(token_ids) + 1)
+                if output_ids[-prefix_length:] == token_ids[:prefix_length]
             ),
             default=0,
         )
-        if holdback:
-            chunk["text"] = text[:-holdback]
+        RuntimeHandle._trim_output_token_metadata(chunk, token_holdback)
 
     @staticmethod
     def _apply_stop_visibility(chunk: dict, visibility: Optional[dict]) -> None:
@@ -565,7 +622,7 @@ class RuntimeHandle:
                 for item in visibility.get("tokens", [])
             )
             if not visible and chunk.get("output_ids", [])[-1:] == [matched]:
-                chunk["output_ids"] = chunk["output_ids"][:-1]
+                RuntimeHandle._trim_output_token_metadata(chunk, 1)
         elif isinstance(matched, str):
             visible = any(
                 item.get("value") == matched and item.get("include_in_output")
@@ -573,6 +630,19 @@ class RuntimeHandle:
             )
             if not visible and chunk.get("text", "").endswith(matched):
                 chunk["text"] = chunk["text"][: -len(matched)]
+            output_ids = chunk.get("output_ids", [])
+            token_holdback = max(
+                (
+                    len(token_ids)
+                    for item in visibility.get("strings", [])
+                    if item.get("value") == matched
+                    and not item.get("include_in_output")
+                    for token_ids in [item.get("_token_ids")]
+                    if token_ids and output_ids[-len(token_ids) :] == token_ids
+                ),
+                default=0,
+            )
+            RuntimeHandle._trim_output_token_metadata(chunk, token_holdback)
 
     async def _run_generate(
         self,

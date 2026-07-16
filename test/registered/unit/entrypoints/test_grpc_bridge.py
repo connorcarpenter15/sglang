@@ -153,22 +153,52 @@ def test_stop_visibility_recovers_missing_match_from_terminal_output():
         hidden_string,
         {
             "strings": [
-                {"value": "END", "include_in_output": False},
+                {
+                    "value": "END",
+                    "include_in_output": False,
+                    "_token_ids": [2],
+                },
                 {"value": "D", "include_in_output": True},
             ]
         },
     )
     assert hidden_string["text"] == "alpha"
+    assert hidden_string["output_ids"] == [1]
     assert hidden_string["meta_info"]["finish_reason"]["matched"] == "END"
 
 
 def test_hidden_stop_prefixes_are_held_back_before_terminal():
-    visibility = {"strings": [{"value": "END", "include_in_output": False}]}
-    partial = {"text": "alphaEN", "meta_info": {"finish_reason": None}}
+    visibility = {
+        "strings": [
+            {
+                "value": "END",
+                "include_in_output": False,
+                "_token_ids": [36, 45, 35],
+            }
+        ]
+    }
+    partial = {
+        "text": "alphaEN",
+        "output_ids": [1, 36, 45],
+        "meta_info": {
+            "finish_reason": None,
+            "output_token_logprobs": [[-0.1, 1], [-0.2, 36], [-0.3, 45]],
+            "output_top_logprobs": [[], [], []],
+            "output_token_logprobs_length": 3,
+        },
+    }
     RuntimeHandle._hold_back_hidden_stop_text(partial, visibility)
     assert partial["text"] == "alpha"
+    assert partial["output_ids"] == [1]
+    assert partial["meta_info"]["output_token_logprobs"] == [[-0.1, 1]]
+    assert partial["meta_info"]["output_top_logprobs"] == [[]]
+    assert partial["meta_info"]["output_token_logprobs_length"] == 1
 
-    diverged = {"text": "alphaENO", "meta_info": {"finish_reason": None}}
+    diverged = {
+        "text": "alphaENO",
+        "output_ids": [1, 36, 45, 46],
+        "meta_info": {"finish_reason": None},
+    }
     RuntimeHandle._hold_back_hidden_stop_text(diverged, visibility)
     assert diverged["text"] == "alphaENO"
 
