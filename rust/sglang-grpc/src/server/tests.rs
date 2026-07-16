@@ -1,8 +1,26 @@
 use super::{
-    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, resolve_max_message_size,
-    terminal_error_status,
+    DEFAULT_GRPC_MAX_MESSAGE_SIZE, generate_response_from_data, openai_status_code,
+    resolve_max_message_size, terminal_error_status,
 };
-use crate::bridge::TerminalError;
+
+#[test]
+fn frozen_schema_hashes_match_the_intentional_v1_baseline() {
+    use sha2::{Digest, Sha256};
+
+    let baseline = include_str!("../../../../proto/sglang/runtime/v1/SCHEMA.sha256");
+    let value = |name: &str| {
+        baseline
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in SCHEMA.sha256"))
+    };
+    let source = include_bytes!("../../../../proto/sglang/runtime/v1/sglang.proto");
+    let source_hash = format!("{:x}", Sha256::digest(source));
+    assert_eq!(source_hash, value("source_sha256"));
+    assert_eq!(crate::descriptor_sha256(), value("descriptor_sha256"));
+    assert_eq!(crate::PROTOCOL_REVISION, value("protocol_revision"));
+}
+use crate::bridge::{ResponseData, TerminalError};
 use std::collections::HashMap;
 use tonic::Code;
 
@@ -36,6 +54,49 @@ fn terminal_error_status_maps_abort_to_cancelled() {
     });
 
     assert_eq!(status.code(), Code::Cancelled);
+}
+
+#[test]
+fn cumulative_choice_output_is_converted_to_deltas() {
+    let mut token_offset = 0;
+    let mut text_offset = 0;
+    let mut logprob_offset = 0;
+    let first = generate_response_from_data(
+        ResponseData {
+            text: Some("he".into()),
+            output_ids: Some(vec![1, 2]),
+            embedding: None,
+            embeddings: None,
+            choice_index: 1,
+            json_bytes: None,
+            meta_info: HashMap::new(),
+        },
+        false,
+        None,
+        &mut token_offset,
+        &mut text_offset,
+        &mut logprob_offset,
+    );
+    let second = generate_response_from_data(
+        ResponseData {
+            text: Some("hello".into()),
+            output_ids: Some(vec![1, 2, 3]),
+            embedding: None,
+            embeddings: None,
+            choice_index: 1,
+            json_bytes: None,
+            meta_info: HashMap::new(),
+        },
+        false,
+        None,
+        &mut token_offset,
+        &mut text_offset,
+        &mut logprob_offset,
+    );
+    assert_eq!(first.delta_output_ids, vec![1, 2]);
+    assert_eq!(first.delta_text.as_deref(), Some("he"));
+    assert_eq!(second.delta_output_ids, vec![3]);
+    assert_eq!(second.delta_text.as_deref(), Some("llo"));
 }
 
 // SAFETY: env vars are process-global; bundle all SGLANG_TONIC_PAYLOAD cases into one
