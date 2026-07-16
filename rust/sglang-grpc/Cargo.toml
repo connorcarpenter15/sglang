@@ -25,6 +25,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 async-stream = "0.3"
 
 [build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
 tonic-build = "0.12"
 
 [features]
