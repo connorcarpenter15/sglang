@@ -604,47 +604,46 @@ class RuntimeHandle:
             # It is a control marker, not generated output, and would otherwise
             # obscure a string stop immediately before it.
             self._trim_output_token_metadata(chunk, 1)
-        if not configured_token_match:
-            # Guided decoding may finish on the same suffix as a configured
-            # stop condition while SGLang reports either no match or its
-            # grammar EOS token. Recover the typed stop reason from the
-            # terminal output so per-stop visibility still applies.
-            text = chunk.get("text", "")
-            string_matches = [
-                item
-                for item in visibility.get("strings", [])
-                if item.get("value") and text.endswith(item["value"])
+        # Guided decoding may finish on the same suffix as a configured string
+        # stop while SGLang reports either its grammar EOS token or a configured
+        # model EOS token. A terminal string suffix is the more specific match
+        # and must win so its own visible/hidden policy is applied.
+        text = chunk.get("text", "")
+        string_matches = [
+            item
+            for item in visibility.get("strings", [])
+            if item.get("value") and text.endswith(item["value"])
+        ]
+        if string_matches:
+            matched = max(string_matches, key=lambda item: len(item["value"]))[
+                "value"
             ]
-            if string_matches:
-                matched = max(string_matches, key=lambda item: len(item["value"]))[
-                    "value"
-                ]
-                output_ids = chunk.get("output_ids", [])
-                if isinstance(output_ids, list):
-                    # SGLang's finish metadata and the appended grammar marker
-                    # can use different internal token IDs. Locate the real
-                    # string-stop suffix through a short trailing control-token
-                    # suffix instead of depending on either internal ID.
-                    for control_tokens in range(1, min(4, len(output_ids)) + 1):
-                        candidate_ids = output_ids[:-control_tokens]
-                        if self._decoded_token_suffix_length(candidate_ids, matched):
-                            self._trim_output_token_metadata(chunk, control_tokens)
-                            break
-            else:
-                output_ids = chunk.get("output_ids", [])
-                if output_ids:
-                    matched_token = next(
-                        (
-                            item.get("token_id")
-                            for item in visibility.get("tokens", [])
-                            if item.get("token_id") == output_ids[-1]
-                        ),
-                        None,
-                    )
-                    if matched_token is not None:
-                        matched = matched_token
-            if matched is not None:
-                finish["matched"] = matched
+            output_ids = chunk.get("output_ids", [])
+            if isinstance(output_ids, list):
+                # SGLang's finish metadata and the appended grammar marker can
+                # use different internal token IDs. Locate the real string-stop
+                # suffix through a short trailing control-token suffix instead
+                # of depending on either internal ID.
+                for control_tokens in range(1, min(4, len(output_ids)) + 1):
+                    candidate_ids = output_ids[:-control_tokens]
+                    if self._decoded_token_suffix_length(candidate_ids, matched):
+                        self._trim_output_token_metadata(chunk, control_tokens)
+                        break
+        elif not configured_token_match:
+            output_ids = chunk.get("output_ids", [])
+            if output_ids:
+                matched_token = next(
+                    (
+                        item.get("token_id")
+                        for item in visibility.get("tokens", [])
+                        if item.get("token_id") == output_ids[-1]
+                    ),
+                    None,
+                )
+                if matched_token is not None:
+                    matched = matched_token
+        if matched is not None:
+            finish["matched"] = matched
         if isinstance(matched, int):
             visible = any(
                 item.get("token_id") == matched and item.get("include_in_output")

@@ -175,6 +175,26 @@ def test_stop_visibility_recovers_missing_match_from_terminal_output():
     assert hidden_string["meta_info"]["finish_reason"]["matched"] == "END"
 
 
+def test_string_stop_wins_when_terminal_also_matches_configured_eos():
+    handle = RuntimeHandle.__new__(RuntimeHandle)
+    handle.tokenizer_manager = _TokenizerManager([], _Tokenizer())
+    hidden_string = {
+        "text": "alphaEND",
+        "output_ids": [1, 36, 45, 35],
+        "meta_info": {"finish_reason": {"type": "stop", "matched": 151645}},
+    }
+    handle._apply_stop_visibility(
+        hidden_string,
+        {
+            "strings": [{"value": "END", "include_in_output": False}],
+            "tokens": [{"token_id": 151645, "include_in_output": False}],
+        },
+    )
+    assert hidden_string["text"] == "alpha"
+    assert hidden_string["output_ids"] == [1]
+    assert hidden_string["meta_info"]["finish_reason"]["matched"] == "END"
+
+
 def test_hidden_stop_prefixes_are_held_back_before_terminal():
     handle = RuntimeHandle.__new__(RuntimeHandle)
     handle.tokenizer_manager = _TokenizerManager([], _Tokenizer())
