@@ -26,6 +26,20 @@ fn prost_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
     )
 }
 
+fn regex_escape_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json::Value {
     let Some(params) = params else {
         return serde_json::json!({});
@@ -95,7 +109,13 @@ fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json:
                 map.insert("ebnf".into(), serde_json::json!(value));
             }
             Some(Constraint::Choice(value)) => {
-                map.insert("choice".into(), serde_json::json!(value.values));
+                let regex = value
+                    .values
+                    .iter()
+                    .map(|choice| regex_escape_literal(choice))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                map.insert("regex".into(), serde_json::json!(format!("(?:{regex})")));
             }
             Some(Constraint::StructuralTag(value)) => {
                 map.insert("structural_tag".into(), serde_json::json!(value));
@@ -389,6 +409,11 @@ pub(crate) fn build_generate_dict(
                 Some(Constraint::Choice(choice)) if choice.values.is_empty() => {
                     return Err("guided choice must contain at least one value".into());
                 }
+                Some(Constraint::Choice(choice))
+                    if choice.values.iter().any(|value| value.is_empty()) =>
+                {
+                    return Err("guided choice values must not be empty".into());
+                }
                 Some(_) => {}
                 None => return Err("guided decoding constraint must be specified".into()),
             }
@@ -616,10 +641,30 @@ mod tests {
         let mapped = build_generate_dict("r", &request).unwrap();
         assert_eq!(mapped["input_ids"], serde_json::json!([1, 2]));
         assert_eq!(mapped["sampling_params"]["sampling_seed"], 7);
-        assert_eq!(
-            mapped["sampling_params"]["choice"],
-            serde_json::json!(["a", "b"])
-        );
+        assert_eq!(mapped["sampling_params"]["regex"], "(?:a|b)");
+    }
+
+    #[test]
+    fn generate_escapes_guided_choices_as_regex() {
+        let request = proto::GenerateRequest {
+            input: Some(proto::generate_request::Input::InputIds(proto::TokenIds {
+                values: vec![1],
+            })),
+            sampling_params: Some(proto::SamplingParams {
+                guided_decoding: Some(proto::GuidedDecoding {
+                    constraint: Some(proto::guided_decoding::Constraint::Choice(
+                        proto::ChoiceConstraint {
+                            values: vec!["a+b".into(), "x.y".into()],
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mapped = build_generate_dict("r", &request).unwrap();
+        assert_eq!(mapped["sampling_params"]["regex"], "(?:a\\+b|x\\.y)");
     }
 
     #[test]
