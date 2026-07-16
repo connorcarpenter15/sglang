@@ -24,9 +24,17 @@ class _Callback:
         return _SendStatus.Ready
 
 
+class _Tokenizer:
+    _pieces = {1: "alpha", 2: "END", 36: "E", 45: "N", 35: "D", 46: "O"}
+
+    def decode(self, token_ids, **_kwargs):
+        return "".join(self._pieces[token_id] for token_id in token_ids)
+
+
 class _TokenizerManager:
-    def __init__(self, chunks):
+    def __init__(self, chunks, tokenizer=None):
         self.chunks = chunks
+        self.tokenizer = tokenizer
 
     async def generate_request(self, _obj, request=None):
         del request
@@ -120,12 +128,14 @@ async def test_interleaved_choices_close_only_after_every_terminal():
 
 
 def test_stop_visibility_is_independent_for_strings_and_tokens():
+    handle = RuntimeHandle.__new__(RuntimeHandle)
+    handle.tokenizer_manager = _TokenizerManager([], _Tokenizer())
     hidden_string = {
         "text": "answer<stop>",
         "output_ids": [1, 2],
         "meta_info": {"finish_reason": {"type": "stop", "matched": "<stop>"}},
     }
-    RuntimeHandle._apply_stop_visibility(
+    handle._apply_stop_visibility(
         hidden_string,
         {"strings": [{"value": "<stop>", "include_in_output": False}]},
     )
@@ -136,7 +146,7 @@ def test_stop_visibility_is_independent_for_strings_and_tokens():
         "output_ids": [1, 2, 99],
         "meta_info": {"finish_reason": {"type": "stop", "matched": 99}},
     }
-    RuntimeHandle._apply_stop_visibility(
+    handle._apply_stop_visibility(
         visible_token,
         {"tokens": [{"token_id": 99, "include_in_output": True}]},
     )
@@ -144,20 +154,18 @@ def test_stop_visibility_is_independent_for_strings_and_tokens():
 
 
 def test_stop_visibility_recovers_missing_match_from_terminal_output():
+    handle = RuntimeHandle.__new__(RuntimeHandle)
+    handle.tokenizer_manager = _TokenizerManager([], _Tokenizer())
     hidden_string = {
         "text": "alphaEND",
         "output_ids": [1, 2],
         "meta_info": {"finish_reason": {"type": "stop", "matched": 151643}},
     }
-    RuntimeHandle._apply_stop_visibility(
+    handle._apply_stop_visibility(
         hidden_string,
         {
             "strings": [
-                {
-                    "value": "END",
-                    "include_in_output": False,
-                    "_token_ids": [2],
-                },
+                {"value": "END", "include_in_output": False},
                 {"value": "D", "include_in_output": True},
             ]
         },
@@ -168,15 +176,9 @@ def test_stop_visibility_recovers_missing_match_from_terminal_output():
 
 
 def test_hidden_stop_prefixes_are_held_back_before_terminal():
-    visibility = {
-        "strings": [
-            {
-                "value": "END",
-                "include_in_output": False,
-                "_token_ids": [36, 45, 35],
-            }
-        ]
-    }
+    handle = RuntimeHandle.__new__(RuntimeHandle)
+    handle.tokenizer_manager = _TokenizerManager([], _Tokenizer())
+    visibility = {"strings": [{"value": "END", "include_in_output": False}]}
     partial = {
         "text": "alphaEN",
         "output_ids": [1, 36, 45],
@@ -187,7 +189,7 @@ def test_hidden_stop_prefixes_are_held_back_before_terminal():
             "output_token_logprobs_length": 3,
         },
     }
-    RuntimeHandle._hold_back_hidden_stop_text(partial, visibility)
+    handle._hold_back_hidden_stop_text(partial, visibility)
     assert partial["text"] == "alpha"
     assert partial["output_ids"] == [1]
     assert partial["meta_info"]["output_token_logprobs"] == [[-0.1, 1]]
@@ -199,7 +201,7 @@ def test_hidden_stop_prefixes_are_held_back_before_terminal():
         "output_ids": [1, 36, 45, 46],
         "meta_info": {"finish_reason": None},
     }
-    RuntimeHandle._hold_back_hidden_stop_text(diverged, visibility)
+    handle._hold_back_hidden_stop_text(diverged, visibility)
     assert diverged["text"] == "alphaENO"
 
 

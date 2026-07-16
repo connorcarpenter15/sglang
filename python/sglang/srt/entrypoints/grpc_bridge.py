@@ -476,7 +476,6 @@ class RuntimeHandle:
 
         try:
             stop_visibility = req_dict.get("grpc_stop_visibility")
-            self._prepare_hidden_stop_token_ids(stop_visibility)
             req_dict = await self._materialize_grpc_request(req_dict)
             obj = GenerateReqInput(**req_dict)
         except Exception as exc:
@@ -515,28 +514,45 @@ class RuntimeHandle:
         if isinstance(output_logprobs, list):
             meta_info["output_token_logprobs_length"] = len(output_logprobs)
 
-    def _prepare_hidden_stop_token_ids(self, visibility: Optional[dict]) -> None:
-        if not visibility:
-            return
+    def _decoded_token_suffix_length(
+        self, output_ids: list[int], expected_text: str
+    ) -> int:
+        """Return the emitted-token suffix that decodes to hidden stop text.
+
+        Encoding a stop string in isolation is not reliable: guided decoding can
+        emit a different, context-dependent tokenization. Decode suffixes of the
+        actual output instead so text and token metadata share one holdback.
+        """
+
+        if not output_ids or not expected_text:
+            return 0
         tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
-        encode = getattr(tokenizer, "encode", None)
-        if encode is None:
-            return
-        for item in visibility.get("strings", []):
-            value = item.get("value")
-            if not value or item.get("include_in_output"):
-                continue
+        decode = getattr(tokenizer, "decode", None)
+        if decode is None:
+            return 0
+        max_suffix_tokens = min(len(output_ids), len(expected_text.encode("utf-8")))
+        for count in range(1, max_suffix_tokens + 1):
             try:
-                item["_token_ids"] = list(encode(value, add_special_tokens=False))
+                decoded = decode(
+                    output_ids[-count:],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                decoded = decode(output_ids[-count:], skip_special_tokens=False)
             except Exception as exc:
                 logger.debug(
-                    "Could not tokenize hidden gRPC stop string of length %s: %s",
-                    len(value),
+                    "Could not decode gRPC output suffix while hiding a stop: %s",
                     exc,
                 )
+                return 0
+            if decoded == expected_text:
+                return count
+        return 0
 
-    @staticmethod
-    def _hold_back_hidden_stop_text(chunk: dict, visibility: Optional[dict]) -> None:
+    def _hold_back_hidden_stop_text(
+        self, chunk: dict, visibility: Optional[dict]
+    ) -> None:
         if not visibility:
             return
         hidden_stops = [
@@ -545,6 +561,7 @@ class RuntimeHandle:
             if item.get("value") and not item.get("include_in_output")
         ]
         text = chunk.get("text")
+        held_text = ""
         if isinstance(text, str):
             holdback = max(
                 (
@@ -556,27 +573,17 @@ class RuntimeHandle:
                 default=0,
             )
             if holdback:
+                held_text = text[-holdback:]
                 chunk["text"] = text[:-holdback]
 
         output_ids = chunk.get("output_ids")
-        if not isinstance(output_ids, list):
+        if not isinstance(output_ids, list) or not held_text:
             return
-        token_holdback = max(
-            (
-                prefix_length
-                for item in visibility.get("strings", [])
-                if not item.get("include_in_output")
-                for token_ids in [item.get("_token_ids")]
-                if token_ids
-                for prefix_length in range(1, len(token_ids) + 1)
-                if output_ids[-prefix_length:] == token_ids[:prefix_length]
-            ),
-            default=0,
+        self._trim_output_token_metadata(
+            chunk, self._decoded_token_suffix_length(output_ids, held_text)
         )
-        RuntimeHandle._trim_output_token_metadata(chunk, token_holdback)
 
-    @staticmethod
-    def _apply_stop_visibility(chunk: dict, visibility: Optional[dict]) -> None:
+    def _apply_stop_visibility(self, chunk: dict, visibility: Optional[dict]) -> None:
         if not visibility:
             return
         finish = chunk.get("meta_info", {}).get("finish_reason")
@@ -631,18 +638,10 @@ class RuntimeHandle:
             if not visible and chunk.get("text", "").endswith(matched):
                 chunk["text"] = chunk["text"][: -len(matched)]
             output_ids = chunk.get("output_ids", [])
-            token_holdback = max(
-                (
-                    len(token_ids)
-                    for item in visibility.get("strings", [])
-                    if item.get("value") == matched
-                    and not item.get("include_in_output")
-                    for token_ids in [item.get("_token_ids")]
-                    if token_ids and output_ids[-len(token_ids) :] == token_ids
-                ),
-                default=0,
-            )
-            RuntimeHandle._trim_output_token_metadata(chunk, token_holdback)
+            if not visible and isinstance(output_ids, list):
+                self._trim_output_token_metadata(
+                    chunk, self._decoded_token_suffix_length(output_ids, matched)
+                )
 
     async def _run_generate(
         self,
