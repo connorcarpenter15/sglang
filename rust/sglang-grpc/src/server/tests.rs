@@ -1,6 +1,6 @@
 use super::{
-    DEFAULT_GRPC_MAX_MESSAGE_SIZE, generate_response_from_data, openai_status_code,
-    resolve_max_message_size, terminal_error_status,
+    DEFAULT_GRPC_MAX_MESSAGE_SIZE, generate_response_from_data, has_finish_reason,
+    openai_status_code, resolve_max_message_size, terminal_error_status,
 };
 
 #[test]
@@ -57,6 +57,18 @@ fn terminal_error_status_maps_abort_to_cancelled() {
 }
 
 #[test]
+fn null_finish_reason_is_not_terminal() {
+    let null_finish = HashMap::from([("finish_reason".to_string(), "null".to_string())]);
+    assert!(!has_finish_reason(&null_finish));
+
+    let stop_finish = HashMap::from([(
+        "finish_reason".to_string(),
+        r#"{"type":"stop","matched":null}"#.to_string(),
+    )]);
+    assert!(has_finish_reason(&stop_finish));
+}
+
+#[test]
 fn cumulative_choice_output_is_converted_to_deltas() {
     let mut token_offset = 0;
     let mut text_offset = 0;
@@ -97,6 +109,58 @@ fn cumulative_choice_output_is_converted_to_deltas() {
     assert_eq!(first.delta_text.as_deref(), Some("he"));
     assert_eq!(second.delta_output_ids, vec![3]);
     assert_eq!(second.delta_text.as_deref(), Some("llo"));
+}
+
+#[test]
+fn cumulative_logprobs_are_converted_to_deltas() {
+    let response_data = |entries: &str, top_entries: &str| ResponseData {
+        text: None,
+        output_ids: None,
+        embedding: None,
+        embeddings: None,
+        choice_index: 0,
+        json_bytes: None,
+        meta_info: HashMap::from([
+            ("output_token_logprobs".to_string(), entries.to_string()),
+            ("output_top_logprobs".to_string(), top_entries.to_string()),
+        ]),
+    };
+    let mut token_offset = 0;
+    let mut text_offset = 0;
+    let mut logprob_offset = 0;
+
+    let first = generate_response_from_data(
+        response_data(
+            "[[-0.1, 10, \"a\"], [-0.2, 11, \"b\"]]",
+            "[[[-0.1, 10, \"a\"]], [[-0.2, 11, \"b\"]]]",
+        ),
+        false,
+        None,
+        &mut token_offset,
+        &mut text_offset,
+        &mut logprob_offset,
+    );
+    let second = generate_response_from_data(
+        response_data(
+            "[[-0.1, 10, \"a\"], [-0.2, 11, \"b\"], [-0.3, 12, \"c\"]]",
+            "[[[-0.1, 10, \"a\"]], [[-0.2, 11, \"b\"]], [[-0.3, 12, \"c\"]]]",
+        ),
+        false,
+        None,
+        &mut token_offset,
+        &mut text_offset,
+        &mut logprob_offset,
+    );
+
+    let first_logprobs = first.logprobs.expect("first logprobs");
+    assert_eq!(first_logprobs.output.len(), 2);
+    assert_eq!(first_logprobs.output[0].token_id, 10);
+    assert_eq!(first_logprobs.output[0].top_logprobs.len(), 1);
+
+    let second_logprobs = second.logprobs.expect("second logprobs");
+    assert_eq!(second_logprobs.output.len(), 1);
+    assert_eq!(second_logprobs.output[0].token_id, 12);
+    assert_eq!(second_logprobs.output[0].text.as_deref(), Some("c"));
 }
 
 // SAFETY: env vars are process-global; bundle all SGLANG_TONIC_PAYLOAD cases into one

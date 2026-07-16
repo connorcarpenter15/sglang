@@ -386,7 +386,7 @@ fn flatten_i32(value: &serde_json::Value, values: &mut Vec<i32>, shape: &mut Vec
 
 fn finish_from_meta(meta: &HashMap<String, String>) -> proto::generate_response::Terminal {
     use proto::generate_response::Terminal;
-    let Some(value) = meta_value(meta, "finish_reason") else {
+    let Some(value) = meta_value(meta, "finish_reason").filter(|value| !value.is_null()) else {
         return Terminal::Error(proto::GenerationError {
             code: proto::GenerationErrorCode::Internal as i32,
             message: "SGLang stream ended without finish_reason".into(),
@@ -434,6 +434,10 @@ fn finish_from_meta(meta: &HashMap<String, String>) -> proto::generate_response:
         reason: reason as i32,
         stop_reason,
     })
+}
+
+fn has_finish_reason(meta: &HashMap<String, String>) -> bool {
+    meta_value(meta, "finish_reason").is_some_and(|value| !value.is_null())
 }
 
 fn generate_response_from_data(
@@ -606,6 +610,17 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        tracing::debug!(
+            rid,
+            max_new_tokens = ?req.sampling_params.as_ref().and_then(|params| params.max_new_tokens),
+            min_new_tokens = ?req.sampling_params.as_ref().and_then(|params| params.min_new_tokens),
+            ignore_eos = ?req.sampling_params.as_ref().and_then(|params| params.ignore_eos),
+            choices = ?req.sampling_params.as_ref().and_then(|params| params.n),
+            return_logprobs = ?req.logprob_options.as_ref().map(|options| options.return_logprobs),
+            top_logprobs = ?req.logprob_options.as_ref().map(|options| options.top_logprobs),
+            priority = req.priority,
+            "received native Generate request"
+        );
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
         let prefill_handoff = req.disaggregated_params.clone();
 
@@ -631,7 +646,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
                     Ok(Some(ResponseChunk::Data(data))) => {
-                        let choice_finished = meta_value(&data.meta_info, "finish_reason").is_some();
+                        let choice_finished = has_finish_reason(&data.meta_info);
                         let choice_index = data.choice_index;
                         if choice_index < 0 || choice_index as usize >= expected_choices {
                             abort_guard.abort_now();

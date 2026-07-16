@@ -623,6 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn generate_maps_limits_and_logprobs() {
+        let request = proto::GenerateRequest {
+            input: Some(proto::generate_request::Input::Text("hello".into())),
+            sampling_params: Some(proto::SamplingParams {
+                max_new_tokens: Some(8),
+                min_new_tokens: Some(8),
+                ignore_eos: Some(true),
+                ..Default::default()
+            }),
+            logprob_options: Some(proto::LogprobOptions {
+                return_logprobs: true,
+                top_logprobs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("r", &request).unwrap();
+        assert_eq!(mapped["sampling_params"]["max_new_tokens"], 8);
+        assert_eq!(mapped["sampling_params"]["min_new_tokens"], 8);
+        assert_eq!(mapped["sampling_params"]["ignore_eos"], true);
+        assert_eq!(mapped["return_logprob"], true);
+        assert_eq!(mapped["top_logprobs_num"], 2);
+    }
+
+    #[test]
     fn tensor_validation_rejects_shape_size_and_dtype_mismatches() {
         let mut tensor = proto::Tensor {
             dtype: proto::TensorDataType::Float32 as i32,
