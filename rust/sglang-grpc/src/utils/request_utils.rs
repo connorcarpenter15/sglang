@@ -567,7 +567,18 @@ pub(crate) fn build_embed_dict(
         }
     }
     let mut request = HashMap::new();
-    request.insert("rid".into(), serde_json::json!(rid));
+    if req.inputs.len() == 1 {
+        request.insert("rid".into(), serde_json::json!(rid));
+    } else {
+        request.insert(
+            "rid".into(),
+            serde_json::json!(
+                (0..req.inputs.len())
+                    .map(|index| format!("{rid}:{index}"))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
     if !texts.is_empty() {
         request.insert("text".into(), serde_json::json!(texts));
     } else if !token_batches.is_empty() {
@@ -778,5 +789,24 @@ mod tests {
             ..Default::default()
         };
         assert!(build_generate_dict("r", &request).is_err());
+    }
+
+    #[test]
+    fn embed_assigns_a_unique_request_id_to_each_batch_item() {
+        let request = proto::EmbedRequest {
+            inputs: vec![
+                proto::EmbedInput {
+                    input: Some(proto::embed_input::Input::Text("one".into())),
+                },
+                proto::EmbedInput {
+                    input: Some(proto::embed_input::Input::Text("two".into())),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mapped = build_embed_dict("batch", &request).unwrap();
+        assert_eq!(mapped["rid"], serde_json::json!(["batch:0", "batch:1"]));
+        assert_eq!(mapped["text"], serde_json::json!(["one", "two"]));
     }
 }
