@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
 
-import pytest
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
