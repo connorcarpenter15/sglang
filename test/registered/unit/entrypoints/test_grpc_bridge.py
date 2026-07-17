@@ -5,6 +5,9 @@ from enum import Enum
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
+import torch
+from PIL import Image
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -102,6 +105,48 @@ class _ControlTokenizerManager:
 
     def abort_request(self, **kwargs):
         self.calls.append(("abort", kwargs))
+
+
+def test_materialized_image_tensor_is_adapted_without_codec_round_trip():
+    pixels = torch.zeros((2, 3, 3), dtype=torch.uint8)
+    pixels[:, :, 0] = 255
+
+    image = RuntimeHandle._normalize_materialized_media(pixels, 1)
+
+    assert isinstance(image, Image.Image)
+    assert image.size == (3, 2)
+    assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_materialized_channel_first_image_is_normalized():
+    pixels = torch.zeros((3, 2, 5), dtype=torch.uint8)
+    pixels[1, :, :] = 127
+
+    image = RuntimeHandle._normalize_materialized_media(pixels, 1)
+
+    assert image.size == (5, 2)
+    assert image.getpixel((0, 0)) == (0, 127, 0)
+
+
+def test_materialized_image_rejects_ambiguous_dtype():
+    with pytest.raises(ValueError, match="uint8"):
+        RuntimeHandle._normalize_materialized_media(
+            torch.zeros((2, 2, 3), dtype=torch.float32), 1
+        )
+
+
+def test_materialized_video_and_audio_tensors_use_processor_layouts():
+    frames = torch.zeros((2, 3, 4, 5), dtype=torch.uint8)
+    samples = torch.linspace(-1, 1, 16, dtype=torch.float32)
+
+    video = RuntimeHandle._normalize_materialized_media(frames, 2)
+    audio = RuntimeHandle._normalize_materialized_media(samples, 3)
+
+    assert video.shape == (2, 4, 5, 3)
+    assert video.flags.c_contiguous
+    assert isinstance(audio, np.ndarray)
+    assert audio.shape == (16,)
+    assert audio.flags.c_contiguous
 
 
 @pytest.mark.asyncio

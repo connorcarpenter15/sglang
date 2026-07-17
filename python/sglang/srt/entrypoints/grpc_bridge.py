@@ -407,6 +407,67 @@ class RuntimeHandle:
         # prompt embeddings are converted with `.tolist()` by the caller.
         return target
 
+    @staticmethod
+    def _normalize_materialized_media(value, modality: int):
+        """Convert decoded tensor media to the types SRT processors consume.
+
+        The native gRPC contract carries already-decoded media as typed
+        tensors. SRT accepts frame tensors for video, but its image loader
+        expects a PIL image and its audio loader expects a NumPy array. Keep
+        the decoded pixels/samples intact while adapting only those container
+        types; no image or audio codec is invoked here.
+        """
+        import numpy as np
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        elif not isinstance(value, np.ndarray):
+            value = np.asarray(value)
+
+        if modality == 1:
+            from PIL import Image
+
+            if value.ndim == 3 and value.shape[0] in (1, 3, 4):
+                if value.shape[-1] not in (1, 3, 4):
+                    value = np.moveaxis(value, 0, -1)
+            if value.ndim == 3 and value.shape[-1] == 1:
+                value = value[..., 0]
+            if value.ndim not in (2, 3) or (
+                value.ndim == 3 and value.shape[-1] not in (3, 4)
+            ):
+                raise ValueError(
+                    "Decoded image tensor must have shape HxW, HxWxC, or CxHxW "
+                    "with C equal to 1, 3, or 4"
+                )
+            if value.dtype != np.uint8:
+                raise ValueError("Decoded image tensor must use uint8 elements")
+            return Image.fromarray(np.ascontiguousarray(value))
+
+        if modality == 2:
+            if value.ndim != 4:
+                raise ValueError(
+                    "Decoded video tensor must have shape TxHxWxC or TxCxHxW"
+                )
+            if value.shape[1] in (1, 3, 4) and value.shape[-1] not in (1, 3, 4):
+                value = np.moveaxis(value, 1, -1)
+            if value.shape[-1] not in (1, 3, 4):
+                raise ValueError(
+                    "Decoded video tensor channel count must be 1, 3, or 4"
+                )
+            if value.dtype != np.uint8:
+                raise ValueError("Decoded video tensor must use uint8 elements")
+            return np.ascontiguousarray(value)
+
+        if modality == 3:
+            if value.ndim not in (1, 2):
+                raise ValueError("Decoded audio tensor must have one or two dimensions")
+            if not np.issubdtype(value.dtype, np.number):
+                raise ValueError("Decoded audio tensor must use a numeric dtype")
+            return np.ascontiguousarray(value)
+
+        raise ValueError(f"Unsupported multimodal tensor modality: {modality}")
+
     async def _materialize_grpc_request(self, req_dict: dict) -> dict:
         req_dict = dict(req_dict)
         tensor = req_dict.pop("grpc_input_embeds", None)
@@ -434,7 +495,10 @@ class RuntimeHandle:
                 encoded = base64.b64encode(bytes(source.get("value") or [])).decode()
                 value = f"data:{mime};base64,{encoded}"
             elif kind in ("tensor", "external"):
-                value = await self._materialize_grpc_tensor(source.get("value"))
+                value = self._normalize_materialized_media(
+                    await self._materialize_grpc_tensor(source.get("value")),
+                    int(item.get("modality", 0)),
+                )
             else:
                 raise ValueError("Multimodal input is missing its source")
             modality = int(item.get("modality", 0))
