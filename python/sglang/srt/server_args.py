@@ -1024,7 +1024,9 @@ class ServerArgs:
     grpc_max_message_size: A[
         int,
         "Maximum encoded native gRPC request/response size in bytes.",
-    ] = 64 * 1024 * 1024
+    ] = (
+        64 * 1024 * 1024
+    )
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],

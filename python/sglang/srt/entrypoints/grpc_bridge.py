@@ -615,9 +615,7 @@ class RuntimeHandle:
             if item.get("value") and text.endswith(item["value"])
         ]
         if string_matches:
-            matched = max(string_matches, key=lambda item: len(item["value"]))[
-                "value"
-            ]
+            matched = max(string_matches, key=lambda item: len(item["value"]))["value"]
             output_ids = chunk.get("output_ids", [])
             if isinstance(output_ids, list):
                 # SGLang's finish metadata and the appended grammar marker can

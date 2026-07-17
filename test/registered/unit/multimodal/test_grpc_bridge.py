@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.multimodal_gen.runtime.entrypoints.grpc_bridge import MediaRuntimeHandle
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _TaskType:
