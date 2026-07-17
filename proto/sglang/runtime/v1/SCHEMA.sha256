@@ -1,0 +1,6 @@
+# Intentional breaking baseline for sglang.runtime.v1.full-parity.1.
+# Update this file only when the protocol revision and generated clients are
+# deliberately advanced together.
+source_sha256=23e16a9ee5e1eb0bcaabb0bb7fa6039b6d6ccb41ff0de2f571cc24fedd879806
+descriptor_sha256=86df17c22382c8756fac78b550d765e4791164b0d3687af313f59d1611110923
+protocol_revision=sglang.runtime.v1.full-parity.1

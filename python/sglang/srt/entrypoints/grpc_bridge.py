@@ -7,6 +7,7 @@ TokenizerManager's event loop.
 """
 
 import asyncio
+import base64
 import dataclasses
 import json
 import logging
@@ -74,6 +75,7 @@ class RuntimeHandle:
         self.scheduler_info = scheduler_info or {}
 
         self._openai_serving_classes = None
+        self._grpc_nixl_connector = None
 
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
@@ -273,47 +275,517 @@ class RuntimeHandle:
             else None
         )
         if req_type == "generate":
-            from sglang.srt.managers.io_struct import GenerateReqInput
-
-            obj = GenerateReqInput(**req_dict)
             stream = req_dict.get("stream", False)
             self._submit_on_tm_loop(
-                self._run_generate(obj, chunk_callback, stream, mock_request)
+                self._prepare_and_run_generate(
+                    req_dict, chunk_callback, stream, mock_request
+                )
             )
         elif req_type == "embed":
-            from sglang.srt.managers.io_struct import EmbeddingReqInput
-
-            obj = EmbeddingReqInput(**req_dict)
-            self._submit_on_tm_loop(self._run_embed(obj, chunk_callback, mock_request))
+            self._submit_on_tm_loop(
+                self._prepare_and_run_embed(req_dict, chunk_callback, mock_request)
+            )
         else:
             raise ValueError(
                 f"Unknown req_type: {req_type!r} (expected 'generate' or 'embed')"
             )
 
-    async def _run_generate(self, obj, chunk_callback, stream: bool, request):
+    @staticmethod
+    def _tensor_dtype(dtype: int):
+        import numpy as np
+
+        dtypes = {
+            1: np.uint8,
+            2: np.int32,
+            3: np.int64,
+            4: np.float16,
+            5: np.dtype("bfloat16") if hasattr(np, "bfloat16") else np.float16,
+            6: np.float32,
+            7: np.float64,
+        }
+        if dtype not in dtypes:
+            raise ValueError(f"Unsupported gRPC tensor dtype: {dtype}")
+        return dtypes[dtype]
+
+    @staticmethod
+    def _torch_tensor_dtype(dtype: int):
+        import torch
+
+        dtypes = {
+            1: torch.uint8,
+            2: torch.int32,
+            3: torch.int64,
+            4: torch.float16,
+            5: torch.bfloat16,
+            6: torch.float32,
+            7: torch.float64,
+        }
+        if dtype not in dtypes:
+            raise ValueError(f"Unsupported gRPC tensor dtype: {dtype}")
+        return dtypes[dtype]
+
+    async def _materialize_grpc_tensor(self, tensor: dict):
+        import io
+
+        import numpy as np
+
+        storage = tensor.get("storage") or {}
+        shape = tuple(int(dim) for dim in tensor.get("shape") or [])
+        if storage.get("kind") == "serialized":
+            if storage.get("format") != "pytorch":
+                raise ValueError(
+                    f"Unsupported serialized tensor format: {storage.get('format')!r}"
+                )
+            import torch
+
+            value = torch.load(
+                io.BytesIO(bytes(storage.get("data") or [])),
+                map_location="cpu",
+                weights_only=True,
+            )
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    "Serialized prompt embeddings did not contain a tensor"
+                )
+            if shape and tuple(value.shape) != shape:
+                raise ValueError(
+                    f"Serialized tensor shape {tuple(value.shape)} does not match {shape}"
+                )
+            return value.detach().cpu().numpy()
+
+        dtype = self._tensor_dtype(int(tensor.get("dtype", 0)))
+        if storage.get("kind") == "inline":
+            array = np.frombuffer(bytes(storage.get("data") or []), dtype=dtype)
+            return array.reshape(shape) if shape else array
+        if storage.get("kind") != "nixl":
+            raise ValueError("gRPC tensor is missing inline or NIXL storage")
+
+        try:
+            import torch
+            from dynamo import nixl_connect
+            from dynamo.nixl_connect import (
+                OperationKind,
+                RdmaMetadata,
+                SerializedDescriptor,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "NIXL external buffers require Dynamo's nixl_connect runtime"
+            ) from exc
+
+        if self._grpc_nixl_connector is None:
+            self._grpc_nixl_connector = nixl_connect.Connector()
+            await self._grpc_nixl_connector.initialize()
+        metadata = json.loads(bytes(storage.get("metadata") or []).decode("utf-8"))
+        descriptor = json.loads(bytes(storage.get("descriptor") or []).decode("utf-8"))
+        remote_device = (
+            "cpu"
+            if descriptor.get("mem_type", "dram").lower() == "dram"
+            else f"cuda:{descriptor.get('device_id', 0)}"
+        )
+        rdma_metadata = RdmaMetadata(
+            descriptors=[
+                SerializedDescriptor(
+                    device=remote_device,
+                    ptr=descriptor["addr"],
+                    size=descriptor["size"],
+                )
+            ],
+            nixl_metadata=metadata,
+            notification_key=f"sglang-grpc-{id(tensor)}",
+            operation_kind=int(OperationKind.READ),
+        )
+        torch_dtype = self._torch_tensor_dtype(int(tensor.get("dtype", 0)))
+        target = torch.empty(shape, dtype=torch_dtype)
+        local_descriptor = nixl_connect.Descriptor(target)
+        operation = await self._grpc_nixl_connector.begin_read(
+            rdma_metadata, local_descriptor
+        )
+        await operation.wait_for_completion()
+        # Keep the torch dtype intact (notably bfloat16, which NumPy cannot
+        # represent portably). GenerateReqInput accepts tensor-like values and
+        # prompt embeddings are converted with `.tolist()` by the caller.
+        return target
+
+    @staticmethod
+    def _normalize_materialized_media(value, modality: int):
+        """Convert decoded tensor media to the types SRT processors consume.
+
+        The native gRPC contract carries already-decoded media as typed
+        tensors. SRT accepts frame tensors for video, but its image loader
+        expects a PIL image and its audio loader expects a NumPy array. Keep
+        the decoded pixels/samples intact while adapting only those container
+        types; no image or audio codec is invoked here.
+        """
+        import numpy as np
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        elif not isinstance(value, np.ndarray):
+            value = np.asarray(value)
+
+        if modality == 1:
+            from PIL import Image
+
+            if value.ndim == 3 and value.shape[0] in (1, 3, 4):
+                if value.shape[-1] not in (1, 3, 4):
+                    value = np.moveaxis(value, 0, -1)
+            if value.ndim == 3 and value.shape[-1] == 1:
+                value = value[..., 0]
+            if value.ndim not in (2, 3) or (
+                value.ndim == 3 and value.shape[-1] not in (3, 4)
+            ):
+                raise ValueError(
+                    "Decoded image tensor must have shape HxW, HxWxC, or CxHxW "
+                    "with C equal to 1, 3, or 4"
+                )
+            if value.dtype != np.uint8:
+                raise ValueError("Decoded image tensor must use uint8 elements")
+            return Image.fromarray(np.ascontiguousarray(value))
+
+        if modality == 2:
+            if value.ndim != 4:
+                raise ValueError(
+                    "Decoded video tensor must have shape TxHxWxC or TxCxHxW"
+                )
+            if value.shape[1] in (1, 3, 4) and value.shape[-1] not in (1, 3, 4):
+                value = np.moveaxis(value, 1, -1)
+            if value.shape[-1] not in (1, 3, 4):
+                raise ValueError(
+                    "Decoded video tensor channel count must be 1, 3, or 4"
+                )
+            if value.dtype != np.uint8:
+                raise ValueError("Decoded video tensor must use uint8 elements")
+            return np.ascontiguousarray(value)
+
+        if modality == 3:
+            if value.ndim not in (1, 2):
+                raise ValueError("Decoded audio tensor must have one or two dimensions")
+            if not np.issubdtype(value.dtype, np.number):
+                raise ValueError("Decoded audio tensor must use a numeric dtype")
+            return np.ascontiguousarray(value)
+
+        raise ValueError(f"Unsupported multimodal tensor modality: {modality}")
+
+    async def _materialize_grpc_request(self, req_dict: dict) -> dict:
+        req_dict = dict(req_dict)
+        tensor = req_dict.pop("grpc_input_embeds", None)
+        if tensor is not None:
+            if isinstance(tensor, list):
+                req_dict["input_embeds"] = [
+                    (await self._materialize_grpc_tensor(value)).tolist()
+                    for value in tensor
+                ]
+            else:
+                req_dict["input_embeds"] = (
+                    await self._materialize_grpc_tensor(tensor)
+                ).tolist()
+
+        mm_inputs = req_dict.pop("grpc_multimodal_inputs", [])
+        hashes_by_modality = {1: [], 2: [], 3: []}
+        by_modality = {1: [], 2: [], 3: []}
+        for item in mm_inputs:
+            source = item.get("source") or {}
+            kind = source.get("kind")
+            if kind == "url":
+                value = source.get("value")
+            elif kind == "inline":
+                mime = item.get("mime_type") or "application/octet-stream"
+                encoded = base64.b64encode(bytes(source.get("value") or [])).decode()
+                value = f"data:{mime};base64,{encoded}"
+            elif kind in ("tensor", "external"):
+                value = self._normalize_materialized_media(
+                    await self._materialize_grpc_tensor(source.get("value")),
+                    int(item.get("modality", 0)),
+                )
+            else:
+                raise ValueError("Multimodal input is missing its source")
+            modality = int(item.get("modality", 0))
+            by_modality[modality].append(value)
+            if item.get("routing_hash"):
+                hashes_by_modality[modality].append(item["routing_hash"])
+        for field, modality in (
+            ("image_data", 1),
+            ("video_data", 2),
+            ("audio_data", 3),
+        ):
+            values = by_modality[modality]
+            if values:
+                req_dict[field] = values[0] if len(values) == 1 else values
+        mm_hashes = [
+            value for modality in (1, 2, 3) for value in hashes_by_modality[modality]
+        ]
+        if mm_hashes:
+            req_dict["mm_hashes"] = mm_hashes
+
+        processor_options = req_dict.pop("grpc_multimodal_processor_options", {})
+        allowed = getattr(
+            __import__(
+                "sglang.srt.managers.io_struct", fromlist=["GenerateReqInput"]
+            ).GenerateReqInput,
+            "__annotations__",
+            {},
+        )
+        for key, value in processor_options.items():
+            if key in allowed and key not in req_dict:
+                req_dict[key] = value
+        req_dict.pop("grpc_stop_visibility", None)
+        return req_dict
+
+    async def _prepare_and_run_generate(
+        self, req_dict, chunk_callback, stream: bool, request
+    ):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        try:
+            stop_visibility = req_dict.get("grpc_stop_visibility")
+            req_dict = await self._materialize_grpc_request(req_dict)
+            obj = GenerateReqInput(**req_dict)
+        except Exception as exc:
+            self._send_native_error(chunk_callback, str(exc))
+            return
+        await self._run_generate(
+            obj, chunk_callback, stream, request, stop_visibility=stop_visibility
+        )
+
+    async def _prepare_and_run_embed(self, req_dict, chunk_callback, request):
+        from sglang.srt.managers.io_struct import EmbeddingReqInput
+
+        try:
+            req_dict = await self._materialize_grpc_request(req_dict)
+            obj = EmbeddingReqInput(**req_dict)
+        except Exception as exc:
+            self._send_native_error(chunk_callback, str(exc))
+            return
+        await self._run_embed(obj, chunk_callback, request)
+
+    @staticmethod
+    def _trim_output_token_metadata(chunk: dict, count: int) -> None:
+        if count <= 0:
+            return
+        output_ids = chunk.get("output_ids")
+        if isinstance(output_ids, list) and len(output_ids) >= count:
+            chunk["output_ids"] = output_ids[:-count]
+        meta_info = chunk.get("meta_info")
+        if not isinstance(meta_info, dict):
+            return
+        for key in ("output_token_logprobs", "output_top_logprobs"):
+            values = meta_info.get(key)
+            if isinstance(values, list) and len(values) >= count:
+                meta_info[key] = values[:-count]
+        output_logprobs = meta_info.get("output_token_logprobs")
+        if isinstance(output_logprobs, list):
+            meta_info["output_token_logprobs_length"] = len(output_logprobs)
+
+    def _decoded_token_suffix_length(
+        self, output_ids: list[int], expected_text: str
+    ) -> int:
+        """Return the emitted-token suffix that decodes to hidden stop text.
+
+        Encoding a stop string in isolation is not reliable: guided decoding can
+        emit a different, context-dependent tokenization. Decode suffixes of the
+        actual output instead so text and token metadata share one holdback.
+        """
+
+        if not output_ids or not expected_text:
+            return 0
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        decode = getattr(tokenizer, "decode", None)
+        if decode is None:
+            return 0
+        max_suffix_tokens = min(len(output_ids), len(expected_text.encode("utf-8")))
+        for count in range(1, max_suffix_tokens + 1):
+            try:
+                decoded = decode(
+                    output_ids[-count:],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                decoded = decode(output_ids[-count:], skip_special_tokens=False)
+            except Exception as exc:
+                logger.debug(
+                    "Could not decode gRPC output suffix while hiding a stop: %s",
+                    exc,
+                )
+                return 0
+            if decoded == expected_text:
+                return count
+        return 0
+
+    def _hold_back_hidden_stop_text(
+        self, chunk: dict, visibility: Optional[dict]
+    ) -> None:
+        if not visibility:
+            return
+        hidden_stops = [
+            item.get("value")
+            for item in visibility.get("strings", [])
+            if item.get("value") and not item.get("include_in_output")
+        ]
+        text = chunk.get("text")
+        held_text = ""
+        if isinstance(text, str):
+            holdback = max(
+                (
+                    prefix_length
+                    for stop in hidden_stops
+                    for prefix_length in range(1, len(stop) + 1)
+                    if text.endswith(stop[:prefix_length])
+                ),
+                default=0,
+            )
+            if holdback:
+                held_text = text[-holdback:]
+                chunk["text"] = text[:-holdback]
+
+        output_ids = chunk.get("output_ids")
+        if not isinstance(output_ids, list) or not held_text:
+            return
+        self._trim_output_token_metadata(
+            chunk, self._decoded_token_suffix_length(output_ids, held_text)
+        )
+
+    def _apply_stop_visibility(self, chunk: dict, visibility: Optional[dict]) -> None:
+        if not visibility:
+            return
+        finish = chunk.get("meta_info", {}).get("finish_reason")
+        if not isinstance(finish, dict) or finish.get("type") != "stop":
+            return
+        matched = finish.get("matched")
+        configured_token_match = isinstance(matched, int) and any(
+            item.get("token_id") == matched for item in visibility.get("tokens", [])
+        )
+        output_ids = chunk.get("output_ids", [])
+        if (
+            isinstance(matched, int)
+            and not configured_token_match
+            and isinstance(output_ids, list)
+            and output_ids[-1:] == [matched]
+        ):
+            # Guided decoding terminates with its internal grammar EOS token.
+            # It is a control marker, not generated output, and would otherwise
+            # obscure a string stop immediately before it.
+            self._trim_output_token_metadata(chunk, 1)
+        # Guided decoding may finish on the same suffix as a configured string
+        # stop while SGLang reports either its grammar EOS token or a configured
+        # model EOS token. A terminal string suffix is the more specific match
+        # and must win so its own visible/hidden policy is applied.
+        text = chunk.get("text", "")
+        string_matches = [
+            item
+            for item in visibility.get("strings", [])
+            if item.get("value") and text.endswith(item["value"])
+        ]
+        if string_matches:
+            matched = max(string_matches, key=lambda item: len(item["value"]))["value"]
+            output_ids = chunk.get("output_ids", [])
+            if isinstance(output_ids, list):
+                # SGLang's finish metadata and the appended grammar marker can
+                # use different internal token IDs. Locate the real string-stop
+                # suffix through a short trailing control-token suffix instead
+                # of depending on either internal ID.
+                for control_tokens in range(1, min(4, len(output_ids)) + 1):
+                    candidate_ids = output_ids[:-control_tokens]
+                    if self._decoded_token_suffix_length(candidate_ids, matched):
+                        self._trim_output_token_metadata(chunk, control_tokens)
+                        break
+        elif not configured_token_match:
+            output_ids = chunk.get("output_ids", [])
+            if output_ids:
+                matched_token = next(
+                    (
+                        item.get("token_id")
+                        for item in visibility.get("tokens", [])
+                        if item.get("token_id") == output_ids[-1]
+                    ),
+                    None,
+                )
+                if matched_token is not None:
+                    matched = matched_token
+        if matched is not None:
+            finish["matched"] = matched
+        if isinstance(matched, int):
+            visible = any(
+                item.get("token_id") == matched and item.get("include_in_output")
+                for item in visibility.get("tokens", [])
+            )
+            if not visible and chunk.get("output_ids", [])[-1:] == [matched]:
+                RuntimeHandle._trim_output_token_metadata(chunk, 1)
+        elif isinstance(matched, str):
+            visible = any(
+                item.get("value") == matched and item.get("include_in_output")
+                for item in visibility.get("strings", [])
+            )
+            if not visible and chunk.get("text", "").endswith(matched):
+                chunk["text"] = chunk["text"][: -len(matched)]
+            output_ids = chunk.get("output_ids", [])
+            if not visible and isinstance(output_ids, list):
+                self._trim_output_token_metadata(
+                    chunk, self._decoded_token_suffix_length(output_ids, matched)
+                )
+
+    async def _run_generate(
+        self,
+        obj,
+        chunk_callback,
+        stream: bool,
+        request,
+        stop_visibility: Optional[dict] = None,
+    ):
         ready_event = None
         try:
             ready_event = self._install_on_ready(chunk_callback) if stream else None
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
+                sampling_params = getattr(obj, "sampling_params", None) or {}
+                expected_choices = max(1, int(sampling_params.get("n", 1)))
+                terminal_choices = set()
                 async for chunk in gen:
-                    finished = (
+                    choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
+                    request_finished = False
+                    if choice_finished:
+                        self._apply_stop_visibility(chunk, stop_visibility)
+                        choice_index = int(chunk.get("index") or 0)
+                        if choice_index in terminal_choices:
+                            self._abort_request_id(obj.rid)
+                            self._send_native_error(
+                                chunk_callback,
+                                f"duplicate terminal for choice {choice_index}",
+                            )
+                            return
+                        terminal_choices.add(choice_index)
+                        request_finished = len(terminal_choices) == expected_choices
+                    else:
+                        self._hold_back_hidden_stop_text(chunk, stop_visibility)
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
                         chunk,
-                        finished=finished,
+                        finished=request_finished,
                         timeout_abort_rid=obj.rid,
                     )
-                    if finished or not keep_going:
+                    if request_finished or not keep_going:
                         return
                 # Defensive: generator exited without a finish_reason chunk.
-                self._safe_callback(chunk_callback, {}, finished=True)
+                missing = sorted(set(range(expected_choices)) - terminal_choices)
+                self._send_native_error(
+                    chunk_callback,
+                    f"SGLang stream ended without terminal choices: {missing}",
+                )
             else:
                 result = await gen.__anext__()
-                self._safe_callback(chunk_callback, result, finished=True)
+                results = result if isinstance(result, list) else [result]
+                for index, item in enumerate(results):
+                    self._apply_stop_visibility(item, stop_visibility)
+                    self._safe_callback(
+                        chunk_callback,
+                        item,
+                        finished=index == len(results) - 1,
+                    )
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
@@ -327,6 +799,16 @@ class RuntimeHandle:
         try:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             result = await gen.__anext__()
+            if isinstance(result, list):
+                result = {
+                    "embedding": [item.get("embedding", []) for item in result],
+                    "meta_info": {
+                        "prompt_tokens": sum(
+                            item.get("meta_info", {}).get("prompt_tokens", 0)
+                            for item in result
+                        )
+                    },
+                }
             self._safe_callback(chunk_callback, result, finished=True)
         except StopAsyncIteration:
             self._safe_callback(chunk_callback, {}, finished=True)
@@ -387,6 +869,11 @@ class RuntimeHandle:
     def get_server_info(self) -> str:
         result: Dict[str, Any] = dataclasses.asdict(self.server_args)
         result.update(self.scheduler_info)
+        describe_kv_events = getattr(
+            self.server_args, "describe_kv_events_publisher", None
+        )
+        if describe_kv_events is not None:
+            result["kv_events"] = describe_kv_events()
         return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
@@ -505,9 +992,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,
@@ -516,6 +1005,119 @@ class RuntimeHandle:
 
         self._submit_json_unary(
             "update_weights",
+            _payload,
+            chunk_callback,
+            error_payload_fn=lambda e: {"success": False, "message": str(e)},
+        )
+
+    def submit_control(self, method: str, json_body: bytes, chunk_callback) -> None:
+        """Dispatch a typed gRPC admin RPC onto TokenizerManager's control API."""
+        payload = json.loads(json_body or b"{}")
+
+        async def _payload():
+            from sglang.srt.managers.io_struct import (
+                LoadLoRAAdapterReqInput,
+                ProfileReq,
+                ReleaseMemoryOccupationReqInput,
+                ResumeMemoryOccupationReqInput,
+                UnloadLoRAAdapterReqInput,
+                UpdateWeightFromDiskReqInput,
+                UpdateWeightsFromDistributedReqInput,
+                UpdateWeightsFromIPCReqInput,
+                UpdateWeightsFromTensorReqInput,
+            )
+
+            tm = self.tokenizer_manager
+            if method == "load_lora":
+                result = await tm.load_lora_adapter(
+                    LoadLoRAAdapterReqInput(
+                        lora_name=payload["name"],
+                        lora_path=payload["path"],
+                        pinned=payload.get("pinned", False),
+                        lora_id=payload.get("id"),
+                    )
+                )
+                return msgspec_to_builtins(result)
+            if method == "unload_lora":
+                result = await tm.unload_lora_adapter(
+                    UnloadLoRAAdapterReqInput(
+                        lora_name=payload["name"], lora_id=payload.get("id")
+                    )
+                )
+                return msgspec_to_builtins(result)
+            if method == "list_loras":
+                adapters = []
+                for name, ref in tm.lora_registry.get_all_adapters().items():
+                    adapters.append(
+                        {
+                            "name": getattr(ref, "lora_name", name),
+                            "path": getattr(ref, "lora_path", ""),
+                            "id": getattr(ref, "lora_id", None),
+                            "pinned": bool(getattr(ref, "pinned", False)),
+                        }
+                    )
+                return {"adapters": adapters}
+            if method == "release_memory":
+                await tm.release_memory_occupation(
+                    ReleaseMemoryOccupationReqInput(tags=payload.get("tags") or None)
+                )
+                return {"success": True, "message": "Memory released."}
+            if method == "resume_memory":
+                await tm.resume_memory_occupation(
+                    ResumeMemoryOccupationReqInput(tags=payload.get("tags") or None)
+                )
+                return {"success": True, "message": "Memory resumed."}
+            if method == "start_profile":
+                await tm.start_profile(ProfileReq(**payload))
+                return {"success": True, "message": "Profiling started."}
+            if method == "stop_profile":
+                await tm.stop_profile()
+                return {"success": True, "message": "Profiling stopped."}
+            if method == "update_weights_from_disk":
+                success, message, num_paused = await tm.update_weights_from_disk(
+                    UpdateWeightFromDiskReqInput(**payload), request=None
+                )
+                return {
+                    "success": success,
+                    "message": message,
+                    "num_paused_requests": num_paused,
+                }
+            if method == "update_weights_from_tensor":
+                payload["serialized_named_tensors"] = [
+                    bytes(value) for value in payload["serialized_named_tensors"]
+                ]
+                success, message = await tm.update_weights_from_tensor(
+                    UpdateWeightsFromTensorReqInput(**payload), request=None
+                )
+                return {"success": success, "message": message}
+            if method == "update_weights_from_distributed":
+                success, message = await tm.update_weights_from_distributed(
+                    UpdateWeightsFromDistributedReqInput(**payload), request=None
+                )
+                return {"success": success, "message": message}
+            if method == "update_weights_from_ipc":
+                success, message = await tm.update_weights_from_ipc(
+                    UpdateWeightsFromIPCReqInput(**payload), request=None
+                )
+                if success and not tm.initial_weights_loaded:
+                    tm.initial_weights_loaded = True
+                return {"success": success, "message": message}
+            if method == "update_weight_version":
+                from sglang.srt.managers.io_struct import UpdateWeightVersionReqInput
+
+                req = UpdateWeightVersionReqInput(**payload)
+                if req.abort_all_requests:
+                    tm.abort_request(abort_all=True)
+                tm.server_args.weight_version = req.new_version
+                return {
+                    "success": True,
+                    "message": f"Weight version updated to {req.new_version}",
+                    "new_version": req.new_version,
+                }
+            raise ValueError(f"Unknown gRPC control method: {method}")
+
+        self._submit_json_unary(
+            method,
             _payload,
             chunk_callback,
             error_payload_fn=lambda e: {"success": False, "message": str(e)},

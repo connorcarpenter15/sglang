@@ -1,18 +1,20 @@
 syntax = "proto3";
+
 package sglang.runtime.v1;
 
+import "google/protobuf/struct.proto";
+
 service SglangService {
-  // SGLang-native RPCs (typed proto)
-  rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
-  rpc TextEmbed(TextEmbedRequest) returns (TextEmbedResponse);
   rpc Embed(EmbedRequest) returns (EmbedResponse);
+  rpc MediaGenerate(MediaGenerateRequest) returns (MediaGenerateResponse);
   rpc Classify(ClassifyRequest) returns (ClassifyResponse);
   rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);
   rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc GetRuntimeInfo(GetRuntimeInfoRequest) returns (GetRuntimeInfoResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc GetLoad(GetLoadRequest) returns (GetLoadResponse);
   rpc Abort(AbortRequest) returns (AbortResponse);
@@ -20,7 +22,6 @@ service SglangService {
   rpc PauseGeneration(PauseGenerationRequest) returns (PauseGenerationResponse);
   rpc ContinueGeneration(ContinueGenerationRequest) returns (ContinueGenerationResponse);
 
-  // OpenAI-compatible RPCs (JSON pass-through)
   rpc ChatComplete(OpenAIRequest) returns (stream OpenAIStreamChunk);
   rpc Complete(OpenAIRequest) returns (stream OpenAIStreamChunk);
   rpc OpenAIEmbed(OpenAIRequest) returns (OpenAIResponse);
@@ -28,27 +29,125 @@ service SglangService {
   rpc Score(OpenAIRequest) returns (OpenAIResponse);
   rpc Rerank(OpenAIRequest) returns (OpenAIResponse);
 
-  // Admin/Ops RPCs
-  rpc StartProfile(StartProfileRequest) returns (StartProfileResponse);
-  rpc StopProfile(StopProfileRequest) returns (StopProfileResponse);
-  rpc UpdateWeightsFromDisk(UpdateWeightsRequest) returns (UpdateWeightsResponse);
+  rpc LoadLoRA(LoadLoRARequest) returns (LoRAUpdateResponse);
+  rpc UnloadLoRA(UnloadLoRARequest) returns (LoRAUpdateResponse);
+  rpc ListLoRAs(ListLoRAsRequest) returns (ListLoRAsResponse);
+  rpc ReleaseMemory(ReleaseMemoryRequest) returns (OperationResponse);
+  rpc ResumeMemory(ResumeMemoryRequest) returns (OperationResponse);
+  rpc StartProfile(StartProfileRequest) returns (ProfileResponse);
+  rpc StopProfile(StopProfileRequest) returns (ProfileResponse);
+  rpc UpdateWeightsFromDisk(UpdateWeightsFromDiskRequest) returns (UpdateWeightsResponse);
+  rpc UpdateWeightsFromTensor(UpdateWeightsFromTensorRequest) returns (UpdateWeightsResponse);
+  rpc UpdateWeightsFromDistributed(UpdateWeightsFromDistributedRequest) returns (UpdateWeightsResponse);
+  rpc UpdateWeightsFromIPC(UpdateWeightsFromIPCRequest) returns (UpdateWeightsResponse);
+  rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (UpdateWeightsResponse);
 }
 
-// Disaggregated prefill/decode rendezvous parameters.
-//
-// Carried on Generate/TextGenerate requests when the worker is part of a
-// disaggregated deployment. The prefill leg writes its KV cache to the
-// bootstrap server identified by (bootstrap_host, bootstrap_port) under
-// the room id; the decode leg fetches it from the same room. Both legs
-// receive the same `bootstrap_room` from the router so they rendezvous
-// on the KV transfer.
+message TokenIds {
+  repeated int32 values = 1;
+}
+
+enum TensorDataType {
+  TENSOR_DATA_TYPE_UNSPECIFIED = 0;
+  TENSOR_DATA_TYPE_UINT8 = 1;
+  TENSOR_DATA_TYPE_INT32 = 2;
+  TENSOR_DATA_TYPE_INT64 = 3;
+  TENSOR_DATA_TYPE_FLOAT16 = 4;
+  TENSOR_DATA_TYPE_BFLOAT16 = 5;
+  TENSOR_DATA_TYPE_FLOAT32 = 6;
+  TENSOR_DATA_TYPE_FLOAT64 = 7;
+}
+
+message NixlBuffer {
+  bytes metadata = 1;
+  bytes descriptor = 2;
+  optional string agent_name = 3;
+  optional uint64 length = 4;
+}
+
+message ExternalBuffer {
+  oneof transport {
+    NixlBuffer nixl = 1;
+  }
+}
+
+message SerializedTensor {
+  string format = 1;
+  bytes data = 2;
+}
+
+message Tensor {
+  TensorDataType dtype = 1;
+  repeated int64 shape = 2;
+  repeated int64 strides = 3;
+  oneof storage {
+    bytes inline_data = 4;
+    ExternalBuffer external = 5;
+    SerializedTensor serialized = 6;
+  }
+}
+
+message ExternalTensor {
+  TensorDataType dtype = 1;
+  repeated int64 shape = 2;
+  repeated int64 strides = 3;
+  ExternalBuffer buffer = 4;
+}
+
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_IMAGE = 1;
+  MODALITY_VIDEO = 2;
+  MODALITY_AUDIO = 3;
+}
+
+message MultimodalInput {
+  Modality modality = 1;
+  oneof source {
+    string url = 2;
+    bytes inline_data = 3;
+    Tensor decoded_tensor = 4;
+    ExternalTensor external_tensor = 5;
+  }
+  optional string mime_type = 6;
+  optional string routing_hash = 7;
+}
+
 message DisaggregatedParams {
   string bootstrap_host = 1;
   int32 bootstrap_port = 2;
   int64 bootstrap_room = 3;
+  optional int32 prefill_dp_rank = 4;
+  optional string bootstrap_pair_key = 5;
+  optional int32 decode_tp_size = 6;
 }
 
-// Sampling parameters shared across text and tokenized RPCs.
+message GuidedDecoding {
+  oneof constraint {
+    string json_schema = 1;
+    string regex = 2;
+    string ebnf = 3;
+    ChoiceConstraint choice = 4;
+    string structural_tag = 5;
+  }
+  optional string backend = 6;
+  optional string whitespace_pattern = 7;
+}
+
+message ChoiceConstraint {
+  repeated string values = 1;
+}
+
+message StringStop {
+  string value = 1;
+  bool include_in_output = 2;
+}
+
+message TokenStop {
+  int32 token_id = 1;
+  bool include_in_output = 2;
+}
+
 message SamplingParams {
   optional float temperature = 1;
   optional float top_p = 2;
@@ -59,128 +158,250 @@ message SamplingParams {
   optional float repetition_penalty = 7;
   optional int32 max_new_tokens = 8;
   optional int32 min_new_tokens = 9;
-  repeated string stop = 10;
-  repeated int32 stop_token_ids = 11;
+  repeated StringStop string_stops = 10;
+  repeated TokenStop token_stops = 11;
   optional bool ignore_eos = 12;
   optional int32 n = 13;
-  optional string json_schema = 14;
-  optional string regex = 15;
+  optional int64 seed = 14;
+  optional GuidedDecoding guided_decoding = 15;
+  optional bool require_reasoning = 16;
+  optional int32 max_thinking_tokens = 17;
 }
 
-// ---- Text-based generate (text in, text out) ----
-
-message TextGenerateRequest {
-  string text = 1;
-  optional SamplingParams sampling_params = 2;
-  optional bool stream = 3;
-  optional bool return_logprob = 4;
-  optional int32 top_logprobs_num = 5;
-  optional int32 logprob_start_len = 6;
-  optional bool return_text_in_logprobs = 7;
-  optional string rid = 8;
-  optional string lora_path = 9;
-  optional string routing_key = 10;
-  optional int32 routed_dp_rank = 11;
-  map<string, string> trace_headers = 12;
-  optional string session_id = 13;
-  optional DisaggregatedParams disaggregated_params = 14;
+message LogprobOptions {
+  bool return_logprobs = 1;
+  int32 top_logprobs = 2;
+  optional int32 prompt_logprob_start = 3;
+  repeated int32 token_ids = 4;
+  bool return_text = 5;
+  bool return_routed_experts = 6;
+  int32 routed_experts_start = 7;
+  bool return_prompt_token_ids = 8;
 }
-
-message TextGenerateResponse {
-  string text = 1;
-  map<string, string> meta_info = 2;
-  bool finished = 3;
-}
-
-// ---- Tokenized generate (input_ids in, token_ids out) ----
 
 message GenerateRequest {
-  repeated int32 input_ids = 1;
-  optional SamplingParams sampling_params = 2;
-  optional bool stream = 3;
-  optional bool return_logprob = 4;
-  optional int32 top_logprobs_num = 5;
-  optional int32 logprob_start_len = 6;
-  optional string rid = 7;
-  optional string lora_path = 8;
-  optional string routing_key = 9;
-  optional int32 routed_dp_rank = 10;
-  map<string, string> trace_headers = 11;
-  optional string session_id = 12;
-  optional DisaggregatedParams disaggregated_params = 13;
+  oneof input {
+    string text = 1;
+    TokenIds input_ids = 2;
+    Tensor input_embeds = 3;
+  }
+  SamplingParams sampling_params = 4;
+  LogprobOptions logprob_options = 5;
+  repeated MultimodalInput multimodal_inputs = 6;
+  google.protobuf.Struct multimodal_processor_options = 7;
+  bool use_audio_in_video = 8;
+  bool stream = 9;
+  optional string rid = 10;
+  optional string lora_path = 11;
+  optional string lora_id = 12;
+  optional string routing_key = 13;
+  optional int32 routed_dp_rank = 14;
+  int32 priority = 15;
+  map<string, string> trace_headers = 16;
+  optional string session_id = 17;
+  optional DisaggregatedParams disaggregated_params = 18;
+}
+
+message LogprobAlternative {
+  float logprob = 1;
+  int32 token_id = 2;
+  optional string text = 3;
+  optional int32 rank = 4;
+}
+
+message TokenLogprob {
+  float logprob = 1;
+  int32 token_id = 2;
+  optional string text = 3;
+  repeated LogprobAlternative top_logprobs = 4;
+}
+
+message Logprobs {
+  repeated TokenLogprob output = 1;
+  repeated TokenLogprob prompt = 2;
+}
+
+message Usage {
+  uint64 prompt_tokens = 1;
+  uint64 completion_tokens = 2;
+  uint64 total_tokens = 3;
+  uint64 cached_prompt_tokens = 4;
+}
+
+message RoutedExpertMetadata {
+  repeated int32 expert_ids = 1;
+  repeated int64 shape = 2;
+  int32 start_position = 3;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_ABORT = 3;
+  FINISH_REASON_CANCELLED = 4;
+}
+
+message StopReason {
+  oneof reason {
+    string matched_string = 1;
+    int32 matched_token_id = 2;
+  }
+}
+
+message GenerationFinish {
+  FinishReason reason = 1;
+  optional StopReason stop_reason = 2;
+}
+
+enum GenerationErrorCode {
+  GENERATION_ERROR_CODE_UNSPECIFIED = 0;
+  GENERATION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  GENERATION_ERROR_CODE_CANCELLED = 2;
+  GENERATION_ERROR_CODE_UNAVAILABLE = 3;
+  GENERATION_ERROR_CODE_INTERNAL = 4;
+  GENERATION_ERROR_CODE_DEADLINE_EXCEEDED = 5;
+}
+
+message GenerationError {
+  GenerationErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
 }
 
 message GenerateResponse {
-  repeated int32 output_ids = 1;
-  map<string, string> meta_info = 2;
-  bool finished = 3;
+  int32 choice_index = 1;
+  repeated int32 delta_output_ids = 2;
+  optional string delta_text = 3;
+  optional Logprobs logprobs = 4;
+  optional Usage usage = 5;
+  optional RoutedExpertMetadata routed_experts = 6;
+  google.protobuf.Struct engine_metadata = 7;
+  optional DisaggregatedParams prefill_handoff = 8;
+  oneof terminal {
+    GenerationFinish finish = 9;
+    GenerationError error = 10;
+  }
 }
 
-// ---- Text-based embed (text in, embedding out) ----
-
-message TextEmbedRequest {
-  string text = 1;
-  optional string rid = 2;
-  optional string routing_key = 3;
-  map<string, string> trace_headers = 4;
+enum EmbeddingEncoding {
+  EMBEDDING_ENCODING_UNSPECIFIED = 0;
+  EMBEDDING_ENCODING_FLOAT = 1;
+  EMBEDDING_ENCODING_BASE64 = 2;
 }
 
-message TextEmbedResponse {
-  repeated float embedding = 1;
-  map<string, string> meta_info = 2;
+message EmbedInput {
+  oneof input {
+    string text = 1;
+    TokenIds input_ids = 2;
+    Tensor input_embeds = 3;
+  }
 }
-
-// ---- Tokenized embed (input_ids in, embedding out) ----
 
 message EmbedRequest {
-  repeated int32 input_ids = 1;
-  optional string rid = 2;
-  optional string routing_key = 3;
-  map<string, string> trace_headers = 4;
+  repeated EmbedInput inputs = 1;
+  optional int32 dimensions = 2;
+  EmbeddingEncoding encoding = 3;
+  optional string rid = 4;
+  optional string routing_key = 5;
+  optional int32 routed_dp_rank = 6;
+  int32 priority = 7;
+  map<string, string> trace_headers = 8;
+}
+
+message FloatEmbedding {
+  repeated float values = 1;
+}
+
+message Embedding {
+  int32 index = 1;
+  oneof data {
+    FloatEmbedding float_values = 2;
+    bytes packed_float32 = 3;
+  }
 }
 
 message EmbedResponse {
-  repeated float embedding = 1;
-  map<string, string> meta_info = 2;
+  repeated Embedding embeddings = 1;
+  optional Usage usage = 2;
 }
 
-// ---- Health check ----
+enum RuntimeKind {
+  RUNTIME_KIND_UNSPECIFIED = 0;
+  RUNTIME_KIND_LLM = 1;
+  RUNTIME_KIND_EMBEDDING = 2;
+  RUNTIME_KIND_IMAGE = 3;
+  RUNTIME_KIND_VIDEO = 4;
+}
+
+enum WorkerRole {
+  WORKER_ROLE_UNSPECIFIED = 0;
+  WORKER_ROLE_AGGREGATED = 1;
+  WORKER_ROLE_PREFILL = 2;
+  WORKER_ROLE_DECODE = 3;
+}
+
+message RuntimeCapacity {
+  uint64 max_context_length = 1;
+  uint64 max_running_requests = 2;
+  uint64 max_total_tokens = 3;
+  uint64 kv_block_size = 4;
+  uint64 total_kv_blocks = 5;
+  uint32 max_lora_adapters = 6;
+}
+
+message DataParallelTopology {
+  uint32 start_rank = 1;
+  uint32 size = 2;
+  uint32 local_start_rank = 3;
+  uint32 local_size = 4;
+}
+
+message ObservabilityEndpoint {
+  uint32 dp_rank = 1;
+  optional string metrics_url = 2;
+  optional string kv_events_zmq_endpoint = 3;
+  optional string kv_events_topic = 4;
+}
+
+message GetRuntimeInfoRequest {}
+
+message GetRuntimeInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  optional string served_model_name = 3;
+  RuntimeKind runtime_kind = 4;
+  WorkerRole worker_role = 5;
+  RuntimeCapacity capacity = 6;
+  DataParallelTopology dp_topology = 7;
+  optional DisaggregatedParams bootstrap = 8;
+  repeated ObservabilityEndpoint observability = 9;
+  string protocol_revision = 10;
+  string descriptor_sha256 = 11;
+  optional string reasoning_parser = 12;
+  optional string tool_call_parser = 13;
+  optional string weight_version = 14;
+}
+
+message MediaGenerateRequest {
+  google.protobuf.Struct request = 1;
+  map<string, string> trace_headers = 2;
+}
+
+message MediaGenerateResponse {
+  google.protobuf.Struct response = 1;
+  int32 status_code = 2;
+}
 
 message HealthCheckRequest {}
-
-message HealthCheckResponse {
-  bool healthy = 1;
-}
-
-// ---- Model info ----
-
+message HealthCheckResponse { bool healthy = 1; }
 message GetModelInfoRequest {}
-
-message GetModelInfoResponse {
-  string model_path = 1;
-  string json_info = 2;
-}
-
-// ---- Server info ----
-
+message GetModelInfoResponse { string model_path = 1; string json_info = 2; }
 message GetServerInfoRequest {}
+message GetServerInfoResponse { string json_info = 1; }
 
-message GetServerInfoResponse {
-  string json_info = 1;
-}
-
-// ---- Abort ----
-
-message AbortRequest {
-  string rid = 1;
-  bool abort_all = 2;
-}
-
-message AbortResponse {
-  bool success = 1;
-}
-
-// ---- Classify (same internal path as embed, uses EmbeddingReqInput) ----
+message AbortRequest { string rid = 1; bool abort_all = 2; }
+message AbortResponse { bool success = 1; }
 
 message ClassifyRequest {
   string text = 1;
@@ -189,125 +410,94 @@ message ClassifyRequest {
   optional string routing_key = 4;
   map<string, string> trace_headers = 5;
 }
+message ClassifyResponse { repeated float embedding = 1; map<string, string> meta_info = 2; }
 
-message ClassifyResponse {
-  repeated float embedding = 1;
-  map<string, string> meta_info = 2;
-}
-
-// ---- Tokenize / Detokenize (local ops, no inference) ----
-
-message TokenizeRequest {
-  string text = 1;
-  optional bool add_special_tokens = 2;
-}
-
-message TokenizeResponse {
-  repeated int32 tokens = 1;
-  int32 count = 2;
-  int32 max_model_len = 3;
-  string input_text = 4;
-}
-
-message DetokenizeRequest {
-  repeated int32 tokens = 1;
-}
-
-message DetokenizeResponse {
-  string text = 1;
-}
-
-// ---- List models ----
+message TokenizeRequest { string text = 1; optional bool add_special_tokens = 2; }
+message TokenizeResponse { repeated int32 tokens = 1; int32 count = 2; int32 max_model_len = 3; string input_text = 4; }
+message DetokenizeRequest { repeated int32 tokens = 1; }
+message DetokenizeResponse { string text = 1; }
 
 message ListModelsRequest {}
+message ListModelsResponse { repeated ModelCard models = 1; }
+message ModelCard { string id = 1; string root = 2; optional string parent = 3; optional int32 max_model_len = 4; }
 
-message ListModelsResponse {
-  repeated ModelCard models = 1;
-}
-
-message ModelCard {
-  string id = 1;
-  string root = 2;
-  optional string parent = 3;
-  optional int32 max_model_len = 4;
-}
-
-// ---- Get load ----
-
-message GetLoadRequest {
-  optional int32 dp_rank = 1;
-}
-
-message GetLoadResponse {
-  string json_info = 1;
-}
-
-// ---- Flush cache ----
-
+message GetLoadRequest { optional int32 dp_rank = 1; }
+message GetLoadResponse { string json_info = 1; }
 message FlushCacheRequest {}
-
-message FlushCacheResponse {
-  bool success = 1;
-  string message = 2;
-}
-
-// ---- Pause / Continue generation ----
-
-message PauseGenerationRequest {
-  string mode = 1;
-}
-
-message PauseGenerationResponse {
-  string message = 1;
-}
-
+message FlushCacheResponse { bool success = 1; string message = 2; }
+message PauseGenerationRequest { string mode = 1; }
+message PauseGenerationResponse { string message = 1; }
 message ContinueGenerationRequest {}
+message ContinueGenerationResponse { string message = 1; }
 
-message ContinueGenerationResponse {
-  string message = 1;
+message OpenAIRequest { bytes json_body = 1; map<string, string> trace_headers = 2; }
+message OpenAIStreamChunk { bytes json_chunk = 1; bool finished = 2; }
+message OpenAIResponse { bytes json_body = 1; int32 status_code = 2; }
+
+message LoadLoRARequest {
+  string name = 1;
+  string path = 2;
+  bool pinned = 3;
+  optional string id = 4;
 }
+message UnloadLoRARequest { string name = 1; optional string id = 2; }
+message ListLoRAsRequest {}
+message LoRAAdapter { string name = 1; string path = 2; optional string id = 3; bool pinned = 4; }
+message LoRAUpdateResponse { bool success = 1; optional string error_message = 2; repeated LoRAAdapter loaded_adapters = 3; }
+message ListLoRAsResponse { repeated LoRAAdapter adapters = 1; }
 
-// ---- OpenAI-compatible pass-through messages ----
-
-message OpenAIRequest {
-  bytes json_body = 1;
-  map<string, string> trace_headers = 2;
-}
-
-message OpenAIStreamChunk {
-  bytes json_chunk = 1;
-  bool finished = 2;
-}
-
-message OpenAIResponse {
-  bytes json_body = 1;
-  int32 status_code = 2;
-}
-
-// ---- Admin: Profile ----
+message ReleaseMemoryRequest { repeated string tags = 1; }
+message ResumeMemoryRequest { repeated string tags = 1; }
+message OperationResponse { bool success = 1; string message = 2; }
 
 message StartProfileRequest {
   optional string output_dir = 1;
+  optional int32 start_step = 2;
+  optional int32 num_steps = 3;
+  repeated string activities = 4;
+  bool profile_by_stage = 5;
+  optional bool with_stack = 6;
+  optional bool record_shapes = 7;
+  optional string profile_id = 8;
+  bool merge_profiles = 9;
+  optional string profile_prefix = 10;
+  repeated string profile_stages = 11;
 }
+message StopProfileRequest { optional string profile_id = 1; }
+message ProfileResponse { bool success = 1; string message = 2; }
 
-message StartProfileResponse {
-  string message = 1;
+message UpdateBehavior {
+  bool flush_cache = 1;
+  bool abort_all_requests = 2;
+  optional string weight_version = 3;
+  bool torch_empty_cache = 4;
 }
-
-message StopProfileRequest {}
-
-message StopProfileResponse {
-  string message = 1;
-}
-
-// ---- Admin: Weight update ----
-
-message UpdateWeightsRequest {
+message UpdateWeightsFromDiskRequest {
   string model_path = 1;
   optional string load_format = 2;
+  UpdateBehavior behavior = 3;
+  bool async_update = 4;
+  bool keep_pause = 5;
+  bool recapture_cuda_graph = 6;
+  int64 token_step = 7;
+  google.protobuf.Struct manifest = 8;
 }
-
-message UpdateWeightsResponse {
-  bool success = 1;
-  string message = 2;
+message UpdateWeightsFromTensorRequest {
+  repeated bytes serialized_named_tensors = 1;
+  optional string load_format = 2;
+  UpdateBehavior behavior = 3;
+  optional bool disable_draft_model = 4;
 }
+message NamedTensorSpec { string name = 1; string dtype = 2; repeated int64 shape = 3; }
+message UpdateWeightsFromDistributedRequest {
+  repeated NamedTensorSpec tensors = 1;
+  string group_name = 2;
+  optional string load_format = 3;
+  UpdateBehavior behavior = 4;
+}
+message UpdateWeightsFromIPCRequest {
+  map<string, string> zmq_handles = 1;
+  UpdateBehavior behavior = 2;
+}
+message UpdateWeightVersionRequest { string new_version = 1; bool abort_all_requests = 2; }
+message UpdateWeightsResponse { bool success = 1; string message = 2; uint32 num_paused_requests = 3; }

@@ -112,7 +112,20 @@ async def lifespan(app: FastAPI):
     async_scheduler_client.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
+    grpc_handle = None
+    media_runtime_handle = None
+    if server_args.grpc_port is not None:
+        from sglang.multimodal_gen.runtime.entrypoints.grpc_bridge import (
+            MediaRuntimeHandle,
+            start_native_grpc_server,
+        )
 
+        media_runtime_handle = MediaRuntimeHandle(
+            app=app,
+            server_args=server_args,
+            event_loop=asyncio.get_running_loop(),
+        )
+        grpc_handle = start_native_grpc_server(server_args, media_runtime_handle)
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     warmup_task = None
@@ -126,6 +139,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if media_runtime_handle is not None:
+            await media_runtime_handle.aclose()
+        if grpc_handle is not None:
+            grpc_handle.shutdown()
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):

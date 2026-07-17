@@ -28,6 +28,8 @@ pub struct ResponseData {
     pub text: Option<String>,
     pub output_ids: Option<Vec<i32>>,
     pub embedding: Option<Vec<f32>>,
+    pub embeddings: Option<Vec<Vec<f32>>>,
+    pub choice_index: i32,
     pub json_bytes: Option<Vec<u8>>,
     pub meta_info: HashMap<String, String>,
 }
@@ -404,6 +406,22 @@ impl PyBridge {
         })
     }
 
+    pub fn submit_control_json(
+        &self,
+        rid: &str,
+        method: &str,
+        json_body: &[u8],
+    ) -> PyResult<Receiver<ResponseChunk>> {
+        self.submit_json(rid, move |py, runtime_handle, callback| {
+            runtime_handle.call_method1(
+                py,
+                "submit_control",
+                (method, PyBytes::new(py, json_body), callback),
+            )?;
+            Ok(())
+        })
+    }
+
     // ------------------------------------------------------------------
     // OpenAI pass-through RPCs
     // ------------------------------------------------------------------
@@ -430,6 +448,29 @@ impl PyBridge {
             kwargs.set_item("chunk_callback", callback)?;
 
             runtime_handle.call_method(py, method_name, (), Some(&kwargs))?;
+            Ok(())
+        })
+    }
+
+    pub fn submit_media(
+        &self,
+        rid: &str,
+        json_body: &[u8],
+        trace_headers: &HashMap<String, String>,
+    ) -> PyResult<Receiver<ResponseChunk>> {
+        self.submit_json(rid, move |py, runtime_handle, callback| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("rid", rid)?;
+            kwargs.set_item("json_body", PyBytes::new(py, json_body))?;
+            if !trace_headers.is_empty() {
+                let py_trace_headers = PyDict::new(py);
+                for (key, value) in trace_headers {
+                    py_trace_headers.set_item(key, value)?;
+                }
+                kwargs.set_item("trace_headers", py_trace_headers)?;
+            }
+            kwargs.set_item("chunk_callback", callback)?;
+            runtime_handle.call_method(py, "submit_media_generate", (), Some(&kwargs))?;
             Ok(())
         })
     }
@@ -666,12 +707,23 @@ impl ChunkCallback {
             .get_item("embedding")?
             .and_then(|v| v.extract::<Vec<f32>>().ok());
 
+        let embeddings: Option<Vec<Vec<f32>>> = chunk
+            .get_item("embedding")?
+            .and_then(|v| v.extract::<Vec<Vec<f32>>>().ok());
+
+        let choice_index = chunk
+            .get_item("index")?
+            .and_then(|v| v.extract::<i32>().ok())
+            .unwrap_or(0);
+
         let meta_info = extract_meta_info(chunk);
 
         let data = ResponseData {
             text,
             output_ids,
             embedding,
+            embeddings,
+            choice_index,
             json_bytes: None,
             meta_info,
         };
@@ -760,6 +812,8 @@ impl JsonChunkCallback {
             text: None,
             output_ids: None,
             embedding: None,
+            embeddings: None,
+            choice_index: 0,
             json_bytes: Some(bytes_data),
             meta_info,
         };
