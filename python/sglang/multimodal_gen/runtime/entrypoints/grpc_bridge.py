@@ -1,15 +1,111 @@
 """Native gRPC adapter for SGLang's image and video generation runtime."""
 
 import asyncio
+import base64
 import json
 import logging
 import threading
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_GRPC_MAX_MESSAGE_SIZE = 64 * 1024 * 1024
+_GRPC_RESPONSE_ENVELOPE_RESERVE = 64 * 1024
+
+
+def _promote_nvext(payload: Dict[str, Any]) -> None:
+    """Promote Dynamo media extensions into SGLang request fields."""
+
+    nvext = payload.pop("nvext", None)
+    if not isinstance(nvext, dict):
+        return
+    for key, value in nvext.items():
+        payload.setdefault(key, value)
+
+
+def _output_format(value: Optional[str], fallback: Optional[str] = None) -> str:
+    if value:
+        return value.lower().lstrip(".")
+    if fallback:
+        suffix = Path(fallback.split("?", 1)[0]).suffix
+        if suffix:
+            return suffix.lower().lstrip(".")
+    return "mp4"
+
+
+def _normalize_video_response(
+    job: Dict[str, Any],
+    request_payload: Dict[str, Any],
+    grpc_max_message_size: int,
+) -> Dict[str, Any]:
+    """Translate SGLang's asynchronous video job into Dynamo's RawEngine shape."""
+
+    requested_format = request_payload.get("output_format")
+    data = []
+    native_data = job.get("data")
+    if isinstance(native_data, list):
+        for item in native_data:
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            item.setdefault(
+                "output_format",
+                _output_format(requested_format, item.get("url")),
+            )
+            data.append(item)
+
+    if not data and job.get("url"):
+        data.append(
+            {
+                "output_format": _output_format(requested_format, job["url"]),
+                "url": job["url"],
+            }
+        )
+
+    if not data and job.get("status") == "completed":
+        file_paths = job.get("file_paths")
+        if not isinstance(file_paths, list) or not file_paths:
+            file_paths = [job.get("file_path")]
+        paths = [Path(path) for path in file_paths if path]
+        raw_limit = max(
+            0,
+            (grpc_max_message_size - _GRPC_RESPONSE_ENVELOPE_RESERVE) * 3 // 4,
+        )
+        total_size = sum(path.stat().st_size for path in paths if path.is_file())
+        if total_size > raw_limit:
+            raise ValueError(
+                "Generated video exceeds the native gRPC message limit; configure "
+                "SGLang cloud storage so MediaGenerate can return a URL"
+            )
+        for path in paths:
+            if not path.is_file():
+                continue
+            data.append(
+                {
+                    "output_format": _output_format(requested_format, path.name),
+                    "b64_json": base64.b64encode(path.read_bytes()).decode("ascii"),
+                }
+            )
+
+    error = job.get("error")
+    if isinstance(error, dict):
+        error = error.get("message") or error.get("detail") or json.dumps(error)
+
+    return {
+        "id": str(job.get("id", "")),
+        "object": str(job.get("object", "video")),
+        "model": str(job.get("model") or request_payload.get("model") or ""),
+        "status": str(job.get("status", "completed")),
+        "progress": int(job.get("progress", 100)),
+        "created": int(job.get("created", job.get("created_at", 0))),
+        "data": data,
+        "error": error,
+        "inference_time_s": job.get("inference_time_s"),
+    }
 
 
 class MediaRuntimeHandle:
@@ -61,6 +157,7 @@ class MediaRuntimeHandle:
     async def _generate(self, rid, json_body, trace_headers, chunk_callback):
         try:
             payload = json.loads(json_body)
+            _promote_nvext(payload)
             endpoint = (
                 "/v1/images/generations" if self._is_image_runtime else "/v1/videos"
             )
@@ -85,6 +182,19 @@ class MediaRuntimeHandle:
                     job = poll.json()
                 if job.get("status") == "failed":
                     status_code = 500
+                response_body = json.dumps(
+                    _normalize_video_response(
+                        job,
+                        payload,
+                        int(
+                            getattr(
+                                self.server_args,
+                                "grpc_max_message_size",
+                                _DEFAULT_GRPC_MAX_MESSAGE_SIZE,
+                            )
+                        ),
+                    )
+                ).encode()
 
             chunk_callback(
                 response_body,

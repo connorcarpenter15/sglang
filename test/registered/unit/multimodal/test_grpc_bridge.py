@@ -1,10 +1,14 @@
 import asyncio
+import base64
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from sglang.multimodal_gen.runtime.entrypoints.grpc_bridge import MediaRuntimeHandle
+from sglang.multimodal_gen.runtime.entrypoints.grpc_bridge import (
+    MediaRuntimeHandle,
+    _normalize_video_response,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -43,12 +47,19 @@ class _Client:
         self.posts.append((endpoint, json, headers))
         if self.image:
             return _Response({"data": [{"url": "image.png"}]})
-        return _Response({"id": "video-1", "status": "queued"})
+        return _Response({"id": "video-1", "model": "wan", "status": "queued"})
 
     async def get(self, endpoint):
         self.polls.append(endpoint)
         return _Response(
-            {"id": "video-1", "status": "completed", "data": [{"url": "video.mp4"}]}
+            {
+                "id": "video-1",
+                "model": "wan",
+                "status": "completed",
+                "progress": 100,
+                "created_at": 123,
+                "url": "https://example.test/video.mp4",
+            }
         )
 
 
@@ -67,7 +78,12 @@ async def test_media_generate_uses_openai_handlers_for_image_and_video(image):
 
     await handle._generate(
         "rid",
-        json.dumps({"prompt": "hello"}).encode(),
+        json.dumps(
+            {
+                "prompt": "hello",
+                "nvext": {"num_inference_steps": 2, "seed": 7},
+            }
+        ).encode(),
         {"traceparent": "trace"},
         lambda payload, **kwargs: calls.append((payload, kwargs)),
     )
@@ -78,7 +94,45 @@ async def test_media_generate_uses_openai_handlers_for_image_and_video(image):
     )
     if not image:
         assert handle._client.polls == ["/v1/videos/video-1"]
-        assert json.loads(calls[0][0])["status"] == "completed"
+        body = json.loads(calls[0][0])
+        assert body["status"] == "completed"
+        assert body["created"] == 123
+        assert body["data"] == [
+            {
+                "output_format": "mp4",
+                "url": "https://example.test/video.mp4",
+            }
+        ]
+    posted = handle._client.posts[0][1]
+    assert "nvext" not in posted
+    assert posted["num_inference_steps"] == 2
+    assert posted["seed"] == 7
+
+
+def test_video_response_embeds_node_local_output(tmp_path):
+    output = tmp_path / "result.webm"
+    output.write_bytes(b"video-bytes")
+
+    response = _normalize_video_response(
+        {
+            "id": "video-2",
+            "model": "wan",
+            "status": "completed",
+            "progress": 100,
+            "created_at": 456,
+            "file_path": str(output),
+        },
+        {"model": "wan"},
+        64 * 1024 * 1024,
+    )
+
+    assert response["created"] == 456
+    assert response["data"] == [
+        {
+            "output_format": "webm",
+            "b64_json": base64.b64encode(b"video-bytes").decode("ascii"),
+        }
+    ]
 
 
 def test_media_health_waits_for_runtime_warmup():
