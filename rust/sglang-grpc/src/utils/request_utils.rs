@@ -584,11 +584,32 @@ pub(crate) fn build_embed_dict(
         request.insert("rid".into(), serde_json::json!(request_ids));
     }
     if !texts.is_empty() {
-        request.insert("text".into(), serde_json::json!(texts));
+        request.insert(
+            "text".into(),
+            if texts.len() == 1 {
+                serde_json::json!(texts[0])
+            } else {
+                serde_json::json!(texts)
+            },
+        );
     } else if !token_batches.is_empty() {
-        request.insert("input_ids".into(), serde_json::json!(token_batches));
+        request.insert(
+            "input_ids".into(),
+            if token_batches.len() == 1 {
+                serde_json::json!(token_batches[0])
+            } else {
+                serde_json::json!(token_batches)
+            },
+        );
     } else {
-        request.insert("grpc_input_embeds".into(), serde_json::json!(tensors));
+        request.insert(
+            "grpc_input_embeds".into(),
+            if tensors.len() == 1 {
+                serde_json::json!(tensors[0])
+            } else {
+                serde_json::json!(tensors)
+            },
+        );
     }
     if let Some(dimensions) = req.dimensions {
         if dimensions == 0 {
@@ -812,5 +833,19 @@ mod tests {
         let mapped = build_embed_dict("batch", &request).unwrap();
         assert_eq!(mapped["rid"], serde_json::json!(["batch:0", "batch:1"]));
         assert_eq!(mapped["text"], serde_json::json!(["one", "two"]));
+    }
+
+    #[test]
+    fn embed_preserves_single_input_shape() {
+        let request = proto::EmbedRequest {
+            inputs: vec![proto::EmbedInput {
+                input: Some(proto::embed_input::Input::Text("one".into())),
+            }],
+            ..Default::default()
+        };
+
+        let mapped = build_embed_dict("single", &request).unwrap();
+        assert_eq!(mapped["rid"], "single");
+        assert_eq!(mapped["text"], "one");
     }
 }
