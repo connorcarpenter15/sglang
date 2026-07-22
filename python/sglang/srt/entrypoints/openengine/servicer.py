@@ -609,7 +609,7 @@ class OpenEngineServicer(
             engine_version=sglang_version,
             engine_role=self.role,
             instance_id=self.instance_id,
-            supported_models=sorted(self.model_aliases),
+            supported_models=[self.served_model_name],
             parallelism=parallelism,
             kv_connector=connector,
             schema_revision=SCHEMA_REVISION,

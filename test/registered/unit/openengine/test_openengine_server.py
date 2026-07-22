@@ -381,9 +381,12 @@ async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
     server_info = await servicer.GetServerInfo(None, _Context())
     assert server_info.schema_revision == 3
     assert server_info.schema_release == OPENENGINE_COMMIT
+    assert list(server_info.supported_models) == ["served"]
     model_info = await servicer.GetModelInfo(
         model_pb2.GetModelInfoRequest(model="served"), _Context()
     )
+    assert model_info.model_id == "canonical"
+    assert list(model_info.served_model_aliases) == ["canonical"]
     assert model_info.tokenizer.source == "canonical"
     sources = await servicer.GetKvEventSources(
         kv_pb2.GetKvEventSourcesRequest(), _Context()
