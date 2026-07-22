@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,6 +107,46 @@ def test_disaggregation_rejects_parallel_outputs_before_scheduling():
             model_aliases={"served"},
             metadata={},
         )
+
+
+@pytest.mark.asyncio
+async def test_handoff_evidence_preserves_uint64_room_as_decimal_string(caplog):
+    runtime = _Runtime(mode="prefill")
+    servicer = OpenEngineServicer(
+        runtime,
+        ProcessAdmission(),
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    request = _request()
+    request.kv.session.CopyFrom(
+        kv_pb2.KvSessionRef(
+            session_id="session-1",
+            handoff_profile=HANDOFF_PROFILE,
+            bootstrap=kv_pb2.KvBootstrap(
+                endpoint=kv_pb2.KvEndpoint(host="prefill", port=8998, protocol="tcp"),
+                room_id=MAX_BOOTSTRAP_ROOM,
+            ),
+        )
+    )
+    with caplog.at_level(logging.INFO):
+        responses = [
+            response async for response in servicer.Generate(request, _Context())
+        ]
+    evidence = [
+        json.loads(record.message.removeprefix("OpenEngine handoff "))
+        for record in caplog.records
+        if "OpenEngine handoff" in record.message
+    ]
+    assert [value["phase"] for value in evidence] == ["admitted", "complete"]
+    assert all(value["session_id"] == "session-1" for value in evidence)
+    assert all(value["handoff_profile"] == HANDOFF_PROFILE for value in evidence)
+    assert all(
+        value["bootstrap"]["room_id"] == str(MAX_BOOTSTRAP_ROOM) for value in evidence
+    )
+    assert [response.WhichOneof("event") for response in responses] == ["prefill_ready"]
+    assert runtime.aborts == []
+    await servicer.close()
 
 
 def test_media_order_and_raw_bytes_survive_conversion():

@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import logging
 import math
 import time
@@ -271,6 +272,39 @@ class OpenEngineServicer(
             ):
                 raise ValueError("SGLang audio prefill/decode is unsupported")
 
+    def _log_handoff(
+        self,
+        request: generation_pb2.GenerateRequest,
+        phase: str,
+        usage: generation_pb2.Usage | None = None,
+    ) -> None:
+        if self.role == server_pb2.ENGINE_ROLE_AGGREGATED:
+            return
+        session = request.kv.session
+        if not session.session_id:
+            return
+        endpoint = session.bootstrap.endpoint
+        record = {
+            "phase": phase,
+            "role": server_pb2.EngineRole.Name(self.role),
+            "request_id": request.request_id,
+            "session_id": session.session_id,
+            "handoff_profile": session.handoff_profile,
+            "bootstrap": {
+                "host": endpoint.host,
+                "port": endpoint.port,
+                "protocol": endpoint.protocol,
+                # Preserve uint64 precision in JSON logs.
+                "room_id": str(session.bootstrap.room_id),
+            },
+        }
+        if usage is not None:
+            record["usage"] = {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+            }
+        logger.info("OpenEngine handoff %s", json.dumps(record, sort_keys=True))
+
     async def Generate(
         self,
         request: generation_pb2.GenerateRequest,
@@ -295,6 +329,7 @@ class OpenEngineServicer(
             session_id = converted.session_id
             await self.admission.admit(request.request_id, session_id)
             admitted = True
+            self._log_handoff(request, "admitted")
 
             if request.lora_name:
                 await self.loras.acquire(request.lora_name)
@@ -458,9 +493,11 @@ class OpenEngineServicer(
                                     total_tokens=prompt_tokens + completion_tokens,
                                 )
                             )
-                    yield response
-                    if converted.is_prefill or finish_count == expected_finishes:
+                    terminal = converted.is_prefill or finish_count == expected_finishes
+                    if terminal:
                         completed = True
+                        self._log_handoff(request, "complete", response.usage)
+                    yield response
 
             if not completed:
                 yield generation_pb2.GenerateResponse(
@@ -511,6 +548,8 @@ class OpenEngineServicer(
         finally:
             if engine_started and not completed:
                 self._abort_wire_request(request.request_id)
+            if admitted and not completed:
+                self._log_handoff(request, "aborted")
             self._engine_request_ids.pop(request.request_id, None)
             if selected_lora:
                 await self.loras.release(selected_lora)
