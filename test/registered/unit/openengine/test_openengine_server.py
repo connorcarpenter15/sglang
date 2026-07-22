@@ -84,6 +84,29 @@ def test_typed_bootstrap_is_required_and_room_is_signed_i64_safe():
         )
 
 
+def test_disaggregation_rejects_parallel_outputs_before_scheduling():
+    request = _request()
+    request.sampling.num_sequences = 2
+    request.kv.session.CopyFrom(
+        kv_pb2.KvSessionRef(
+            session_id="session-1",
+            handoff_profile=HANDOFF_PROFILE,
+            bootstrap=kv_pb2.KvBootstrap(
+                endpoint=kv_pb2.KvEndpoint(host="prefill", port=8998, protocol="tcp"),
+                room_id=1,
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="one output sequence"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_PREFILL,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+        )
+
+
 def test_media_order_and_raw_bytes_survive_conversion():
     request = _request()
     request.media.extend(
