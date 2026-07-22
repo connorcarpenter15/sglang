@@ -1112,7 +1112,7 @@ class OpenEngineServicer(
 
         # These environment switches bypass the normal ServerArgs selection
         # chain, so inspect them directly before claiming event compatibility.
-        from sglang.srt import envs
+        from sglang.srt.environ import envs
 
         if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
             return "experimental_cpp_radix_tree"
