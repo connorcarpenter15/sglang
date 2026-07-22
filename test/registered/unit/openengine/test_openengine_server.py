@@ -433,6 +433,29 @@ async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
     await servicer.close()
 
 
+def test_kv_source_discovery_fails_closed_for_nonstandard_cache(caplog):
+    async def check():
+        runtime = _Runtime()
+        runtime.server_args.enable_flexkv = True
+        servicer = OpenEngineServicer(
+            runtime,
+            ProcessAdmission(),
+            advertised_host="127.0.0.1",
+            instance_id="instance",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            sources = await servicer.GetKvEventSources(
+                kv_pb2.GetKvEventSourcesRequest(), _Context()
+            )
+
+        assert not sources.sources
+        assert "unsupported cache mode enable_flexkv" in caplog.text
+        await servicer.close()
+
+    asyncio.run(check())
+
+
 @pytest.mark.asyncio
 async def test_servicer_logs_completed_lazy_lora_selection(tmp_path, caplog):
     runtime = _Runtime()

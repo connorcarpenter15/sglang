@@ -296,6 +296,7 @@ class Session:
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
+            lora_name=getattr(req, "lora_name", None),
             session=self,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
@@ -312,6 +313,7 @@ class Session:
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
+            cache_salt=getattr(req, "cache_salt", None),
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )

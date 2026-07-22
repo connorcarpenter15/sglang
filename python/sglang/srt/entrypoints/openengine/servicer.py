@@ -1088,9 +1088,50 @@ class OpenEngineServicer(
     async def GetKvConnectorInfo(self, request, context) -> kv_pb2.KvConnectorInfo:
         return self._connector_info()
 
+    def _unsupported_kv_event_cache(self) -> str | None:
+        """Return why canonical Dynamo KV routing events cannot be advertised."""
+        unsupported_flags = (
+            "disable_radix_cache",
+            "enable_hierarchical_cache",
+            "enable_lmcache",
+            "enable_flexkv",
+            "enable_unified_memory",
+            "uses_mamba_radix_cache",
+        )
+        for flag in unsupported_flags:
+            if getattr(self.args, flag, False):
+                return flag
+
+        backend = getattr(self.args, "radix_cache_backend", None)
+        if backend is not None:
+            return f"radix_cache_backend={backend}"
+
+        model_config = getattr(self.tm, "model_config", None)
+        if getattr(model_config, "is_hybrid_swa", False):
+            return "hybrid_swa"
+
+        # These environment switches bypass the normal ServerArgs selection
+        # chain, so inspect them directly before claiming event compatibility.
+        from sglang.srt import envs
+
+        if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+            return "experimental_cpp_radix_tree"
+        if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+            return "unified_radix_tree"
+        return None
+
     async def GetKvEventSources(
         self, request, context
     ) -> kv_pb2.GetKvEventSourcesResponse:
+        unsupported_cache = self._unsupported_kv_event_cache()
+        if unsupported_cache is not None:
+            logger.warning(
+                "OpenEngine KV event discovery is disabled for unsupported cache "
+                "mode %s; only the standard Python RadixCache emits canonical "
+                "LoRA and cache-salt namespaces",
+                unsupported_cache,
+            )
+            return kv_pb2.GetKvEventSourcesResponse()
         descriptor = self.args.describe_kv_events_publisher()
         if descriptor is None:
             return kv_pb2.GetKvEventSourcesResponse()

@@ -28,9 +28,14 @@ import unittest
 import unittest.mock
 from array import array
 
+import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.disaggregation.kv_events import (
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -424,6 +429,57 @@ class TestRadixCache(unittest.TestCase):
                         self.assertLessEqual(len(event.token_ids), page_size)
                 else:
                     self.assertEqual(len(events), 0)
+
+    def test_kv_cache_events_preserve_routing_namespaces_on_wire(self):
+        """Base, LoRA, salt, and combined events retain positional wire slots."""
+        cases = [
+            (None, None),
+            ("adapter-a", None),
+            (None, "tenant-a"),
+            ("adapter-a", "tenant-a"),
+        ]
+
+        for lora_name, cache_salt in cases:
+            with self.subTest(lora_name=lora_name, cache_salt=cache_salt):
+                cache = RadixCache.create_simulated(
+                    page_size=2, enable_kv_cache_events=True
+                )
+                cache.take_events()  # Clear the reset event.
+                key = RadixKey(
+                    array("q", [1, 2]),
+                    extra_key="internal-cache-key",
+                    lora_name=lora_name,
+                    cache_salt=cache_salt,
+                )
+                node = TreeNode()
+                node.parent = cache.root_node
+                node.key = key[:]
+                node.hash_value = ["00" * 32]
+                cache._record_store_event(node)
+
+                [event] = [
+                    item
+                    for item in cache.take_events()
+                    if isinstance(item, BlockStored)
+                ]
+                expected_extra_keys = (
+                    [[f"dynamo-cache-salt:{cache_salt}"]] if cache_salt else None
+                )
+                self.assertEqual(event.lora_name, lora_name)
+                self.assertEqual(event.extra_keys, expected_extra_keys)
+
+                payload = msgspec.msgpack.encode(
+                    KVEventBatch(ts=1.0, events=[event], attn_dp_rank=0)
+                )
+                batch_wire = msgspec.msgpack.decode(payload)
+                event_wire = batch_wire[1][0]
+                self.assertEqual(event_wire[0], "BlockStored")
+                self.assertIsNone(event_wire[5])  # Historical lora_id slot.
+                self.assertEqual(event_wire[6], "GPU")
+                wire_lora_name = event_wire[7] if len(event_wire) > 7 else None
+                wire_extra_keys = event_wire[8] if len(event_wire) > 8 else None
+                self.assertEqual(wire_lora_name, lora_name)
+                self.assertEqual(wire_extra_keys, expected_extra_keys)
 
     def test_kv_cache_events_with_eviction(self):
         """Test KV cache events include removal events."""
