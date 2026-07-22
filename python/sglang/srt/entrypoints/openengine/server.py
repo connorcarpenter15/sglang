@@ -7,9 +7,10 @@ import os
 import grpc
 from openengine.v1 import openengine_pb2_grpc
 
+from sglang.srt.utils.network import get_local_ip_auto
+
 from .admission import ProcessAdmission
 from .servicer import OpenEngineServicer
-from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 

@@ -26,8 +26,11 @@ from sglang.srt.entrypoints.openengine.converters import (
     convert_generate,
 )
 from sglang.srt.entrypoints.openengine.lora_registry import LoraRegistry
-from sglang.srt.entrypoints.openengine.servicer import OpenEngineServicer
 from sglang.srt.entrypoints.openengine.server import resolve_advertised_host
+from sglang.srt.entrypoints.openengine.servicer import OpenEngineServicer
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-c-test-cpu")
 
 
 class _Context:
