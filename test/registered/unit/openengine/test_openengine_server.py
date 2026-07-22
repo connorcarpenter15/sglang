@@ -9,6 +9,7 @@ from openengine.v1 import (
     generation_pb2,
     input_pb2,
     kv_pb2,
+    lifecycle_pb2,
     lora_pb2,
     model_pb2,
     observability_pb2,
@@ -304,6 +305,29 @@ class _TokenizerManager:
         return _LoraResult()
 
 
+class _AbortAcknowledgingTokenizerManager(_TokenizerManager):
+    def __init__(self):
+        super().__init__()
+        self.abort_terminal = asyncio.Event()
+
+    async def generate_request(self, obj, request=None):
+        yield {
+            "text": "Hi",
+            "output_ids": [1],
+            "meta_info": {"finish_reason": None},
+        }
+        await self.abort_terminal.wait()
+        yield {
+            "text": "",
+            "output_ids": [],
+            "meta_info": {
+                "finish_reason": {"type": "abort"},
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+            },
+        }
+
+
 class _Runtime:
     def __init__(self, *, mode="null"):
         self.tokenizer_manager = _TokenizerManager()
@@ -349,6 +373,12 @@ class _Runtime:
 
     def health_check(self):
         return True
+
+
+class _AbortFailingRuntime(_Runtime):
+    def abort(self, **kwargs):
+        self.aborts.append(kwargs)
+        raise RuntimeError("scheduler abort failed")
 
 
 def test_advertised_host_prefers_injected_pod_ip(monkeypatch):
@@ -456,4 +486,124 @@ async def test_dropped_parallel_stream_aborts_every_engine_request():
     assert all(
         value["rid"].startswith("parallel.openengine.") for value in runtime.aborts
     )
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_all_parallel_abort_terminals():
+    runtime = _Runtime()
+    runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
+    admission = ProcessAdmission()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    request = _request("parallel-gated")
+    request.sampling.num_sequences = 2
+    stream = servicer.Generate(request, _Context())
+    await anext(stream)
+    await stream.aclose()
+
+    async def collect_drain():
+        return [
+            response
+            async for response in servicer.Drain(
+                lifecycle_pb2.DrainRequest(stop_accepting_new_requests=True),
+                _Context(),
+            )
+        ]
+
+    drain_task = asyncio.create_task(collect_drain())
+    await asyncio.sleep(0.01)
+    assert await admission.snapshot() == (1, 0)
+    assert not drain_task.done()
+    assert len(runtime.aborts) == 2
+
+    runtime.tokenizer_manager.abort_terminal.set()
+    updates = await asyncio.wait_for(drain_task, timeout=1)
+    assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
+    assert await admission.snapshot() == (0, 0)
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_abort_signal_failure_retains_admission_until_engine_terminal():
+    runtime = _AbortFailingRuntime()
+    runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
+    admission = ProcessAdmission()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    stream = servicer.Generate(_request("abort-failure"), _Context())
+    await anext(stream)
+    await stream.aclose()
+
+    assert runtime.aborts == [{"rid": "abort-failure"}]
+    assert await admission.snapshot() == (1, 0)
+    load = await servicer.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    assert load.running_requests == 1
+
+    async def collect_drain():
+        return [
+            response
+            async for response in servicer.Drain(
+                lifecycle_pb2.DrainRequest(stop_accepting_new_requests=True),
+                _Context(),
+            )
+        ]
+
+    drain_task = asyncio.create_task(collect_drain())
+    await asyncio.sleep(0.01)
+    assert not drain_task.done()
+
+    runtime.tokenizer_manager.abort_terminal.set()
+    updates = await asyncio.wait_for(drain_task, timeout=1)
+    assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
+    assert await admission.snapshot() == (0, 0)
+    load = await servicer.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    assert load.running_requests == 0
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_holds_lora_lease_until_abort_terminal(tmp_path):
+    runtime = _Runtime()
+    runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
+    runtime.server_args.enable_lora = True
+    runtime.server_args.dp_size = 1
+    admission = ProcessAdmission()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    await servicer.LoadLora(
+        lora_pb2.LoadLoraRequest(adapter=_adapter(tmp_path)), _Context()
+    )
+    request = _request("lora-gated")
+    request.lora_name = "adapter"
+    stream = servicer.Generate(request, _Context())
+    await anext(stream)
+    await stream.aclose()
+    await servicer.UnloadLora(
+        lora_pb2.UnloadLoraRequest(lora_name="adapter"), _Context()
+    )
+
+    await asyncio.sleep(0.01)
+    assert runtime.tokenizer_manager.lora_unloads == []
+    assert await admission.snapshot() == (1, 0)
+
+    runtime.tokenizer_manager.abort_terminal.set()
+    assert await admission.wait_empty(timeout=1)
+    for _ in range(20):
+        if runtime.tokenizer_manager.lora_unloads:
+            break
+        await asyncio.sleep(0)
+    assert runtime.tokenizer_manager.lora_unloads == ["adapter"]
     await servicer.close()

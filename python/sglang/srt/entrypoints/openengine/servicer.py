@@ -199,9 +199,119 @@ class OpenEngineServicer(
         self.model_aliases = {self.served_model_name, self.model_id}
         self.loras = LoraRegistry(self.tm)
         self._engine_request_ids: dict[str, tuple[str, ...]] = {}
+        self._request_reapers: set[asyncio.Task[None]] = set()
+        self._reaper_owners: dict[asyncio.Task[None], tuple[str, str, str]] = {}
 
-    async def close(self) -> None:
-        await self.loras.close()
+    async def close(self, timeout: float = 5.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        if self._request_reapers:
+            cleanup_reserve = min(0.1, max(0.0, timeout))
+            _, pending = await asyncio.wait(
+                tuple(self._request_reapers),
+                timeout=max(0.0, deadline - loop.time() - cleanup_reserve),
+            )
+            owners = tuple(
+                owner
+                for task in pending
+                if (owner := self._reaper_owners.get(task)) is not None
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                _, stubborn = await asyncio.wait(
+                    pending, timeout=max(0.0, deadline - loop.time())
+                )
+                if stubborn:
+                    logger.error(
+                        "Timed out cancelling %d OpenEngine cleanup streams",
+                        len(stubborn),
+                    )
+            cleanups = {
+                asyncio.create_task(
+                    self._finish_reaped_request(request_id, selected_lora, session_id)
+                )
+                for request_id, selected_lora, session_id in owners
+            }
+            if cleanups:
+                _, incomplete = await asyncio.wait(
+                    cleanups, timeout=max(0.0, deadline - loop.time())
+                )
+                for task in incomplete:
+                    task.cancel()
+                if incomplete:
+                    logger.error(
+                        "Timed out finalizing %d OpenEngine request owners",
+                        len(incomplete),
+                    )
+        lora_close = asyncio.create_task(self.loras.close())
+        _, incomplete = await asyncio.wait(
+            {lora_close}, timeout=max(0.0, deadline - loop.time())
+        )
+        if incomplete:
+            lora_close.cancel()
+            logger.error("Timed out closing the OpenEngine LoRA registry")
+
+    async def _finish_reaped_request(
+        self, request_id: str, selected_lora: str, session_id: str
+    ) -> None:
+        self._engine_request_ids.pop(request_id, None)
+        try:
+            if selected_lora:
+                await self.loras.release(selected_lora)
+        finally:
+            await self.admission.finish(request_id, session_id)
+
+    async def _shield_engine_outputs(self, generator, pending_next):
+        """Keep the engine's next-output task alive if the gRPC consumer exits."""
+        while True:
+            task = asyncio.create_task(anext(generator))
+            pending_next[0] = task
+            try:
+                output = await asyncio.shield(task)
+            except StopAsyncIteration:
+                pending_next[0] = None
+                return
+            finally:
+                if task.done():
+                    pending_next[0] = None
+            yield output
+
+    def _start_request_reaper(
+        self,
+        request_id: str,
+        generator,
+        pending_next: asyncio.Task | None,
+        selected_lora: str,
+        session_id: str,
+    ) -> None:
+        async def reap() -> None:
+            try:
+                if pending_next is not None:
+                    try:
+                        await pending_next
+                    except StopAsyncIteration:
+                        return
+                async for _ in generator:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("OpenEngine cleanup stream failed for %s", request_id)
+            finally:
+                await self._finish_reaped_request(request_id, selected_lora, session_id)
+
+        task = asyncio.create_task(
+            reap(), name=f"sglang-openengine-reaper-{request_id}"
+        )
+        self._request_reapers.add(task)
+        self._reaper_owners[task] = (request_id, selected_lora, session_id)
+
+        def forget(completed: asyncio.Task[None]) -> None:
+            self._request_reapers.discard(completed)
+            self._reaper_owners.pop(completed, None)
+
+        task.add_done_callback(forget)
 
     def _split_engine_requests(self, request_id: str, converted, count: int):
         if count == 1:
@@ -334,6 +444,8 @@ class OpenEngineServicer(
         completed = False
         selected_lora = ""
         session_id = ""
+        generator = None
+        pending_next: list[asyncio.Task | None] = [None]
         try:
             metadata = _request_metadata(context)
             self._validate_media_request(request)
@@ -370,7 +482,7 @@ class OpenEngineServicer(
             finish_count = 0
             final_usage: dict[int, generation_pb2.Usage] = {}
 
-            async for output in generator:
+            async for output in self._shield_engine_outputs(generator, pending_next):
                 meta = output.get("meta_info") or {}
                 index = int(output.get("index", 0))
                 finish = meta.get("finish_reason")
@@ -568,16 +680,31 @@ class OpenEngineServicer(
                 await context.abort(grpc.StatusCode.INTERNAL, str(error))
         finally:
             if engine_started and not completed:
-                self._abort_wire_request(request.request_id)
+                try:
+                    self._abort_wire_request(request.request_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to signal engine abort for %s; retaining ownership until terminal",
+                        request.request_id,
+                    )
             if admitted and not completed:
                 self._log_handoff(request, "aborted")
             if selected_lora and not completed:
                 self._log_lora_selection(request, "aborted")
-            self._engine_request_ids.pop(request.request_id, None)
-            if selected_lora:
-                await self.loras.release(selected_lora)
-            if admitted:
-                await self.admission.finish(request.request_id, session_id)
+            if engine_started and not completed:
+                self._start_request_reaper(
+                    request.request_id,
+                    generator,
+                    pending_next[0],
+                    selected_lora,
+                    session_id,
+                )
+            else:
+                self._engine_request_ids.pop(request.request_id, None)
+                if selected_lora:
+                    await self.loras.release(selected_lora)
+                if admitted:
+                    await self.admission.finish(request.request_id, session_id)
 
     async def GetServerInfo(self, request, context) -> server_pb2.ServerInfo:
         connector = self._connector_info()
@@ -724,7 +851,10 @@ class OpenEngineServicer(
         snapshots = await self.tm.get_loads(dp_rank=None)
         values = [value.to_dict() for value in snapshots]
         page_size = max(1, int(self.args.page_size or 1))
-        _, sessions = await self.admission.snapshot()
+        in_flight, sessions = await self.admission.snapshot()
+        scheduler_running = sum(
+            int(value.get("num_running_reqs", 0)) for value in values
+        )
         timestamp = (
             max((value.get("timestamp", 0) for value in values), default=0)
             or time.time()
@@ -732,9 +862,7 @@ class OpenEngineServicer(
         info = observability_pb2.LoadInfo(
             instance_id=self.instance_id,
             timestamp_unix_nanos=int(timestamp * 1_000_000_000),
-            running_requests=sum(
-                int(value.get("num_running_reqs", 0)) for value in values
-            ),
+            running_requests=max(scheduler_running, in_flight),
             queued_requests=sum(
                 int(value.get("num_waiting_reqs", 0)) for value in values
             ),
@@ -753,6 +881,7 @@ class OpenEngineServicer(
             waiting_tokens=sum(
                 int(value.get("num_waiting_uncached_tokens", 0)) for value in values
             ),
+            attributes={"openengine_admitted_requests": str(in_flight)},
         )
         if request.include_per_rank:
             for value in values:

@@ -76,7 +76,8 @@ class OpenEngineServer:
         await self.admission.wait_empty(timeout=grace)
         elapsed = asyncio.get_running_loop().time() - started
         await self._server.stop(grace=max(0.0, grace - elapsed))
-        await self.servicer.close()
+        elapsed = asyncio.get_running_loop().time() - started
+        await self.servicer.close(timeout=max(0.0, grace - elapsed))
         logger.info("OpenEngine sibling server stopped")
 
 
