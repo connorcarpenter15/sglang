@@ -1078,6 +1078,22 @@ class ServerArgs:
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+    openengine_host: A[
+        str,
+        "Host for the prototype OpenEngine gRPC server started alongside HTTP. "
+        "The server is disabled unless --openengine-port is set.",
+    ] = "127.0.0.1"
+    openengine_advertise_host: A[
+        Optional[str],
+        "Routable host advertised for OpenEngine-discovered KV and event endpoints. "
+        "Defaults to OPENENGINE_ADVERTISED_HOST, POD_IP, an auto-detected address "
+        "for wildcard listeners, or --openengine-host for local listeners.",
+    ] = None
+    openengine_port: A[
+        Optional[int],
+        "Port for the prototype OpenEngine gRPC server started alongside HTTP. "
+        "Unset by default.",
+    ] = None
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -3346,6 +3362,18 @@ class ServerArgs:
                     f"({self.grpc_worker_threads}) must be >= 1"
                 )
 
+        if self.openengine_port is not None:
+            if not self.openengine_host:
+                raise ValueError("--openengine-host must not be empty")
+            if self.openengine_advertise_host in ("", "*", "0.0.0.0", "::", "[::]"):
+                raise ValueError(
+                    "--openengine-advertise-host must be a routable host, not a bind wildcard"
+                )
+            if not (1 <= self.openengine_port <= 65535):
+                raise ValueError(
+                    f"--openengine-port ({self.openengine_port}) must be between 1 and 65535"
+                )
+
         # Native gRPC is incompatible with launch paths it doesn't wire into.
         # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
         native_grpc = self.grpc_port is not None and not legacy_grpc
@@ -3369,6 +3397,33 @@ class ServerArgs:
                 raise ValueError(
                     "--grpc-port is incompatible with --api-key/--admin-api-key: "
                     "the native gRPC listener bypasses HTTP auth middleware."
+                )
+
+        if self.openengine_port is not None:
+            if legacy_grpc:
+                raise ValueError(
+                    "--openengine-port is not supported with --smg-grpc-mode: "
+                    "OpenEngine is a sibling of the HTTP server."
+                )
+            if self.use_ray:
+                raise ValueError(
+                    "--openengine-port is not supported with --use-ray: the Ray "
+                    "serve launch path does not start the OpenEngine server."
+                )
+            if self.encoder_only:
+                raise ValueError(
+                    "--openengine-port is not supported with --encoder-only: "
+                    "encoder disaggregation is outside the OpenEngine milestone."
+                )
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "OpenEngine does not yet support --tokenizer-worker-num > 1. "
+                    "Unset --openengine-port or set --tokenizer-worker-num 1."
+                )
+            if self.api_key or self.admin_api_key:
+                raise ValueError(
+                    "--openengine-port is incompatible with --api-key/--admin-api-key: "
+                    "the OpenEngine listener is plaintext and bypasses HTTP auth middleware."
                 )
 
     def _handle_prefill_delayer_env_compat(self):
@@ -7794,6 +7849,17 @@ class ServerArgs:
             raise ValueError(
                 f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
             )
+
+        if self.openengine_port is not None:
+            if self.openengine_port == self.port:
+                raise ValueError(
+                    f"--openengine-port ({self.openengine_port}) must differ from --port ({self.port})"
+                )
+            if self.openengine_port == self.grpc_port:
+                raise ValueError(
+                    f"--openengine-port ({self.openengine_port}) must differ from "
+                    f"--grpc-port ({self.grpc_port})"
+                )
 
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
         # to avoid opaque bind errors at runtime. Deferred because metrics_http_port

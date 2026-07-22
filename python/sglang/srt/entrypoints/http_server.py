@@ -106,6 +106,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.openengine.admission import HttpAdmissionMiddleware
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -265,6 +266,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
+    openengine_server = None
     warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
@@ -386,17 +388,45 @@ async def lifespan(fast_api_app: FastAPI):
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
     # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        runtime_handle = None
+        openengine_enabled = server_args.openengine_port is not None
+        native_grpc_enabled = server_args.grpc_port is not None and not (
+            server_args.smg_grpc_mode or server_args.grpc_mode
+        )
+        if getattr(fast_api_app, "is_single_tokenizer_mode", False) and (
+            native_grpc_enabled or openengine_enabled
+        ):
+            from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+
+            runtime_handle = RuntimeHandle(
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                server_args=server_args,
+                scheduler_info=_global_state.scheduler_info or {},
+            )
+
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
-            and server_args.grpc_port is not None
-            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+            and native_grpc_enabled
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
-                tokenizer_manager=_global_state.tokenizer_manager,
-                template_manager=_global_state.template_manager,
-                scheduler_info=_global_state.scheduler_info,
+                runtime_handle=runtime_handle,
             )
+
+        if (
+            getattr(fast_api_app, "is_single_tokenizer_mode", False)
+            and openengine_enabled
+        ):
+            from sglang.srt.entrypoints.openengine.server import OpenEngineServer
+
+            openengine_server = OpenEngineServer(
+                runtime_handle=runtime_handle,
+                host=server_args.openengine_host,
+                port=server_args.openengine_port,
+            )
+            fast_api_app.state.openengine_admission = openengine_server.admission
+            await openengine_server.start()
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
@@ -408,6 +438,8 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        if openengine_server is not None:
+            await openengine_server.stop()
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
@@ -427,6 +459,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(HttpAdmissionMiddleware)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -2592,12 +2625,9 @@ def _setup_and_run_http_server(
 
 def _start_native_grpc_server_for_runtime(
     server_args,
-    tokenizer_manager,
-    template_manager,
-    scheduler_info,
+    runtime_handle,
 ):
     try:
-        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
         from sglang.srt.grpc import _core as grpc_native
     except ImportError as e:
         raise RuntimeError(
@@ -2606,13 +2636,6 @@ def _start_native_grpc_server_for_runtime(
             "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
             "install a wheel that includes the extension or unset --grpc-port."
         ) from e
-
-    runtime_handle = RuntimeHandle(
-        tokenizer_manager=tokenizer_manager,
-        template_manager=template_manager,
-        server_args=server_args,
-        scheduler_info=scheduler_info or {},
-    )
 
     grpc_handle = grpc_native.start_server(
         host=server_args.host,
