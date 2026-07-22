@@ -270,6 +270,8 @@ class _TokenizerManager:
     def __init__(self):
         self.model_config = SimpleNamespace(context_len=4096)
         self.mm_processor = None
+        self.lora_loads = []
+        self.lora_unloads = []
 
     async def generate_request(self, obj, request=None):
         yield {
@@ -289,6 +291,14 @@ class _TokenizerManager:
 
     async def get_loads(self, dp_rank=None):
         return [_Load()]
+
+    async def load_lora_adapter(self, request, _):
+        self.lora_loads.append(request.lora_name)
+        return _LoraResult()
+
+    async def unload_lora_adapter(self, request, _):
+        self.lora_unloads.append(request.lora_name)
+        return _LoraResult()
 
 
 class _Runtime:
@@ -384,6 +394,39 @@ async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
     ]
     load = await servicer.GetLoad(observability_pb2.GetLoadRequest(), _Context())
     assert load.total_kv_blocks == 64
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_servicer_logs_completed_lazy_lora_selection(tmp_path, caplog):
+    runtime = _Runtime()
+    runtime.server_args.enable_lora = True
+    runtime.server_args.dp_size = 1
+    servicer = OpenEngineServicer(
+        runtime,
+        ProcessAdmission(),
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    await servicer.LoadLora(
+        lora_pb2.LoadLoraRequest(adapter=_adapter(tmp_path)), _Context()
+    )
+    request = _request("lora-request")
+    request.lora_name = "adapter"
+    with caplog.at_level(logging.INFO):
+        responses = [
+            response async for response in servicer.Generate(request, _Context())
+        ]
+    evidence = [
+        json.loads(record.message.removeprefix("OpenEngine LoRA selection "))
+        for record in caplog.records
+        if "OpenEngine LoRA selection" in record.message
+    ]
+    assert [value["phase"] for value in evidence] == ["selected", "complete"]
+    assert all(value["lora_name"] == "adapter" for value in evidence)
+    assert all(value["request_id"] == "lora-request" for value in evidence)
+    assert runtime.tokenizer_manager.lora_loads == ["adapter"]
+    assert responses[-1].usage.total_tokens == 3
     await servicer.close()
 
 

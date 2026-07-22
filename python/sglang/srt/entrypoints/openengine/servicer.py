@@ -305,6 +305,25 @@ class OpenEngineServicer(
             }
         logger.info("OpenEngine handoff %s", json.dumps(record, sort_keys=True))
 
+    def _log_lora_selection(
+        self, request: generation_pb2.GenerateRequest, phase: str
+    ) -> None:
+        if not request.lora_name:
+            return
+        logger.info(
+            "OpenEngine LoRA selection %s",
+            json.dumps(
+                {
+                    "phase": phase,
+                    "role": server_pb2.EngineRole.Name(self.role),
+                    "request_id": request.request_id,
+                    "session_id": request.kv.session.session_id,
+                    "lora_name": request.lora_name,
+                },
+                sort_keys=True,
+            ),
+        )
+
     async def Generate(
         self,
         request: generation_pb2.GenerateRequest,
@@ -334,6 +353,7 @@ class OpenEngineServicer(
             if request.lora_name:
                 await self.loras.acquire(request.lora_name)
                 selected_lora = request.lora_name
+                self._log_lora_selection(request, "selected")
 
             expected_finishes = int(converted.request.sampling_params.get("n", 1) or 1)
             engine_requests = self._split_engine_requests(
@@ -497,6 +517,7 @@ class OpenEngineServicer(
                     if terminal:
                         completed = True
                         self._log_handoff(request, "complete", response.usage)
+                        self._log_lora_selection(request, "complete")
                     yield response
 
             if not completed:
@@ -550,6 +571,8 @@ class OpenEngineServicer(
                 self._abort_wire_request(request.request_id)
             if admitted and not completed:
                 self._log_handoff(request, "aborted")
+            if selected_lora and not completed:
+                self._log_lora_selection(request, "aborted")
             self._engine_request_ids.pop(request.request_id, None)
             if selected_lora:
                 await self.loras.release(selected_lora)
