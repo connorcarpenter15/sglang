@@ -206,6 +206,30 @@ async def test_process_admission_drains_without_dropping_admitted_requests():
     assert await admission.wait_empty(timeout=0.01)
 
 
+@pytest.mark.asyncio
+async def test_abort_all_reaches_http_only_requests():
+    runtime = _Runtime()
+    admission = ProcessAdmission()
+    await admission.admit_external()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+
+    response = await servicer.Abort(
+        lifecycle_pb2.AbortRequest(all_requests=lifecycle_pb2.AllRequests()),
+        _Context(),
+    )
+
+    assert response.status == lifecycle_pb2.ABORT_STATUS_ABORTED
+    assert await admission.active_request_ids() == ()
+    assert runtime.aborts == [{"abort_all": True}]
+    await admission.finish_external()
+    await servicer.close()
+
+
 class _LoraResult:
     def __init__(self, success=True, error_message=""):
         self.success = success

@@ -955,12 +955,6 @@ class OpenEngineServicer(
             for request_id in request_ids:
                 self._abort_wire_request(request_id)
         elif target == "all_requests":
-            active = await self.admission.active_request_ids()
-            if not active:
-                return lifecycle_pb2.AbortResponse(
-                    status=lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED,
-                    message="No OpenEngine requests are active",
-                )
             self.runtime.abort(abort_all=True)
         else:
             await context.abort(
