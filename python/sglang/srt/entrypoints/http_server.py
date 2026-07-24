@@ -267,6 +267,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
     openengine_server = None
+    sidecar = None
     warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
@@ -413,6 +414,10 @@ async def lifespan(fast_api_app: FastAPI):
                 server_args=server_args,
                 runtime_handle=runtime_handle,
             )
+            if server_args.sidecar is not None:
+                from sglang.srt.entrypoints.sidecar import start_sidecar
+
+                sidecar = start_sidecar(server_args)
 
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
@@ -440,6 +445,11 @@ async def lifespan(fast_api_app: FastAPI):
     finally:
         if openengine_server is not None:
             await openengine_server.stop()
+        if sidecar is not None:
+            try:
+                sidecar.stop()
+            except Exception:
+                logger.exception("Failed to stop sidecar")
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
