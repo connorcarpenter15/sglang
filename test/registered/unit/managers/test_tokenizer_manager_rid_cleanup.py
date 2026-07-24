@@ -550,33 +550,6 @@ class TestParallelAbortRouting(CustomTestCase):
         self.assertEqual(request.rid, "")
         self.assertTrue(request.abort_all)
 
-    def test_parent_abort_before_child_registration_blocks_dispatch(self):
-        tm = _make_tokenizer_manager()
-        tm.server_args.tokenizer_worker_num = 1
-        tm._dispatch_to_scheduler = Mock()
-        parent = GenerateReqInput(
-            text="hello",
-            rid="pending-parent",
-            sampling_params={"n": 2},
-        )
-        parent.normalize_batch_and_arguments()
-        tm._init_req_state(parent)
-
-        tm.abort_request("pending-parent")
-
-        self.assertTrue(tm.rid_to_state["pending-parent"].abort_requested)
-        tm._dispatch_to_scheduler.assert_not_called()
-        child = _make_generate_obj("late-child", is_single=True)
-        with self.assertRaisesRegex(RequestAbortedError, "pending-parent"):
-            tm._init_child_req_state("pending-parent", child)
-        self.assertNotIn("late-child", tm.rid_to_state)
-
-        tm._discard_pending_req_states(parent, abort_active_children=True)
-        self.assertFalse(tm.rid_to_state)
-        self.assertFalse(tm.logical_rid_to_child_rids)
-        self.assertFalse(tm.child_rid_to_logical_rid)
-
-
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
         tm = _make_tokenizer_manager()

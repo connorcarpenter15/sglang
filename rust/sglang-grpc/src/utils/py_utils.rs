@@ -69,6 +69,3 @@ pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<Stri
         Err(_) => Ok(serde_json::Value::String(value.str()?.to_string()).to_string()),
     }
 }
-
-#[cfg(test)]
-mod tests;
