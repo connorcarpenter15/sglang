@@ -223,7 +223,9 @@ def _media(request: generation_pb2.GenerateRequest) -> dict[str, Any]:
     return result
 
 
-_NUMBERED_MEDIA_PLACEHOLDER = re.compile(r"<\|(image|video|audio)_([^|]+)\|>")
+_NUMBERED_MEDIA_PLACEHOLDER = re.compile(
+    r"<\|(image|video|audio)_([0-9]+)\|>"
+)
 
 
 def _encode_placeholder(tokenizer: Any, text: str) -> list[int]:

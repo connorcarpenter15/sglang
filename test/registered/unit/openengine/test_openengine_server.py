@@ -373,6 +373,37 @@ def test_media_conversion_accepts_native_regex_alias():
     assert converted.text == "Ask <image_alias>"
 
 
+def test_media_conversion_does_not_treat_native_pad_token_as_numbered():
+    processor = _multimodal_processor()
+    processor.mm_tokens.image_token = (
+        "<|vision_start|><|image_pad|><|vision_end|>"
+    )
+    processor.mm_tokens.image_token_regex = re.compile(
+        r"<\|vision_start\|><\|image_pad\|><\|vision_end\|>"
+    )
+    processor.mm_tokens.combined_regex = None
+    processor.get_unexpanded_mm_token = lambda modality: None
+    request = _request()
+    request.prompt = "Ask <|vision_start|><|image_pad|><|vision_end|>"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_IMAGE,
+            data_uri="data:image/png;base64,AA==",
+        )
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=processor,
+    ).request
+
+    assert converted.text == request.prompt
+
+
 def test_media_token_ids_accept_native_regex_alias_without_replacement_hook():
     processor = _multimodal_processor()
     processor.mm_tokens.audio_token_regex = re.compile(r"<audio(?:_alias)?>")
