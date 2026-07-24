@@ -1,0 +1,953 @@
+import asyncio
+import json
+import logging
+import re
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from openengine.v1 import (
+    generation_pb2,
+    kv_pb2,
+    lifecycle_pb2,
+    lora_pb2,
+    model_pb2,
+    server_pb2,
+)
+
+from sglang.srt.entrypoints.openengine._schema_pin import OPENENGINE_COMMIT
+from sglang.srt.entrypoints.openengine.admission import (
+    DrainingError,
+    ProcessAdmission,
+)
+from sglang.srt.entrypoints.openengine.converters import (
+    HANDOFF_PROFILE,
+    MAX_BOOTSTRAP_ROOM,
+    convert_generate,
+)
+from sglang.srt.entrypoints.openengine.lora_registry import LoraRegistry
+from sglang.srt.entrypoints.openengine.server import resolve_advertised_host
+from sglang.srt.entrypoints.openengine.servicer import OpenEngineServicer
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-c-test-cpu")
+
+
+class _Context:
+    def __init__(self, metadata=()):
+        self._metadata = metadata
+
+    def invocation_metadata(self):
+        return self._metadata
+
+    async def abort(self, code, details):
+        raise RuntimeError((code, details))
+
+
+def _request(request_id="request-1"):
+    request = generation_pb2.GenerateRequest(
+        request_id=request_id,
+        model="served",
+        prompt="Hello",
+    )
+    request.stopping.max_tokens = 8
+    return request
+
+
+def test_typed_bootstrap_is_required_and_room_is_signed_i64_safe():
+    request = _request()
+    request.kv.session.CopyFrom(
+        kv_pb2.KvSessionRef(
+            session_id="session-1",
+            handoff_profile=HANDOFF_PROFILE,
+            bootstrap=kv_pb2.KvBootstrap(
+                endpoint=kv_pb2.KvEndpoint(host="decode", port=8998, protocol="tcp"),
+                room_id=MAX_BOOTSTRAP_ROOM,
+            ),
+        )
+    )
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_PREFILL,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={"openengine-target-dp-rank": "0"},
+    )
+    assert converted.request.bootstrap_host == "decode"
+    assert converted.request.bootstrap_port == 8998
+    assert converted.request.bootstrap_room == MAX_BOOTSTRAP_ROOM
+    assert converted.request.sampling_params["max_new_tokens"] == 1
+
+    request.kv.session.bootstrap.room_id = MAX_BOOTSTRAP_ROOM + 1
+    with pytest.raises(ValueError, match="room_id"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_DECODE,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+        )
+
+
+def test_disaggregation_rejects_parallel_outputs_before_scheduling():
+    request = _request()
+    request.sampling.num_sequences = 2
+    request.kv.session.CopyFrom(
+        kv_pb2.KvSessionRef(
+            session_id="session-1",
+            handoff_profile=HANDOFF_PROFILE,
+            bootstrap=kv_pb2.KvBootstrap(
+                endpoint=kv_pb2.KvEndpoint(host="prefill", port=8998, protocol="tcp"),
+                room_id=1,
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="one output sequence"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_PREFILL,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_handoff_evidence_preserves_uint64_room_as_decimal_string(caplog):
+    runtime = _Runtime(mode="prefill")
+    servicer = OpenEngineServicer(
+        runtime,
+        ProcessAdmission(),
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    request = _request()
+    request.kv.session.CopyFrom(
+        kv_pb2.KvSessionRef(
+            session_id="session-1",
+            handoff_profile=HANDOFF_PROFILE,
+            bootstrap=kv_pb2.KvBootstrap(
+                endpoint=kv_pb2.KvEndpoint(host="prefill", port=8998, protocol="tcp"),
+                room_id=MAX_BOOTSTRAP_ROOM,
+            ),
+        )
+    )
+    with caplog.at_level(logging.INFO):
+        responses = [
+            response async for response in servicer.Generate(request, _Context())
+        ]
+    evidence = [
+        json.loads(record.message.removeprefix("OpenEngine handoff "))
+        for record in caplog.records
+        if "OpenEngine handoff" in record.message
+    ]
+    assert [value["phase"] for value in evidence] == ["admitted", "complete"]
+    assert all(value["session_id"] == "session-1" for value in evidence)
+    assert all(value["handoff_profile"] == HANDOFF_PROFILE for value in evidence)
+    assert all(
+        value["bootstrap"]["room_id"] == str(MAX_BOOTSTRAP_ROOM) for value in evidence
+    )
+    assert [response.WhichOneof("event") for response in responses] == ["prefill_ready"]
+    assert runtime.aborts == []
+    await servicer.close()
+
+
+def _multimodal_processor():
+    class _Tokenizer:
+        def encode(self, text, *, add_special_tokens):
+            assert not add_special_tokens
+            token_ids = {
+                "<|endoftext11|>": [21, 22],
+                "<image>": [31, 32, 33],
+                "<video>": [34, 35],
+                "<|audio_1|>": [41, 42],
+                "<|image_1|>": [51, 52],
+            }
+            return token_ids[text]
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            assert not skip_special_tokens
+            if token_ids == [7, 41, 42, 8, 51, 52]:
+                return "Ask <|audio_1|> then <|image_1|>"
+            if token_ids == [7, 61, 62]:
+                return "Ask <audio_alias>"
+            return "Ask"
+
+    class _Processor:
+        get_unexpanded_mm_token = BaseMultimodalProcessor.get_unexpanded_mm_token
+
+    processor = _Processor()
+    processor._tokenizer = _Tokenizer()
+    processor.mm_tokens = MultimodalSpecialTokens(
+        audio_token="<|endoftext11|>",
+        audio_token_id=22,
+        image_token="<image>",
+        image_token_id=32,
+        video_token="<video>",
+        video_token_id=35,
+    ).build(SimpleNamespace(tokenizer=processor._tokenizer))
+    return processor
+
+
+def test_media_order_and_raw_bytes_survive_conversion():
+    request = _request()
+    request.prompt = "<image><video><image>Hello"
+    request.media.extend(
+        [
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                data_uri="data:image/png;base64,AA==",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                raw_bytes=b"video",
+                mime_type="video/mp4",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                url="https://example.test/image.png",
+            ),
+        ]
+    )
+    request.media_options.update(
+        {
+            "image": {"image_max_dynamic_patch": 4},
+            "video": {"use_audio_in_video": False},
+        }
+    )
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=_multimodal_processor(),
+    ).request
+    assert converted.modalities == ["image", "video", "image"]
+    assert converted.image_data == [
+        "data:image/png;base64,AA==",
+        "https://example.test/image.png",
+    ]
+    assert converted.video_data == ["data:video/mp4;base64,dmlkZW8="]
+    assert converted.image_max_dynamic_patch == 4
+
+
+@pytest.mark.parametrize(
+    ("input_kind", "original", "expected"),
+    [
+        (
+            "prompt",
+            "Ask <|audio_1|> then <|image_1|>",
+            "Ask <|endoftext11|> then <image>",
+        ),
+        (
+            "prompt",
+            "<|endoftext11|> then <image> Ask",
+            "<|endoftext11|> then <image> Ask",
+        ),
+        (
+            "token_ids",
+            [7, 41, 42, 8, 51, 52],
+            [7, 21, 22, 8, 31, 32, 33],
+        ),
+    ],
+)
+def test_media_conversion_normalizes_processor_placeholders(
+    input_kind, original, expected
+):
+    request = _request()
+    if input_kind == "prompt":
+        request.prompt = original
+    else:
+        request.ClearField("prompt")
+        request.token_ids.ids.extend(original)
+    request.media.extend(
+        [
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                data_uri="data:audio/wav;base64,AA==",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                data_uri="data:image/png;base64,AA==",
+            ),
+        ]
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=_multimodal_processor(),
+    ).request
+
+    assert getattr(converted, "text" if input_kind == "prompt" else "input_ids") == (
+        expected
+    )
+
+
+def test_qwen_video_marker_includes_vision_boundaries():
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    token_text = {
+        1: "<|vision_start|>",
+        2: "<|video_pad|>",
+        3: "<|vision_end|>",
+    }
+    processor = object.__new__(QwenVLImageProcessor)
+    processor._tokenizer = SimpleNamespace(
+        convert_ids_to_tokens=lambda token_ids: [
+            token_text[token_id] for token_id in token_ids
+        ]
+    )
+    processor.vision_start_token_id = 1
+    processor.vision_end_token_id = 3
+    processor.mm_tokens = SimpleNamespace(video_token_id=2)
+
+    assert processor.get_unexpanded_mm_token(Modality.VIDEO) == (
+        "<|vision_start|><|video_pad|><|vision_end|>"
+    )
+
+
+def test_canonical_qwen_audio_without_complete_marker_fails_closed():
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    processor = object.__new__(QwenVLImageProcessor)
+    processor._tokenizer = SimpleNamespace()
+    processor.audio_start_token_id = 4
+    processor.audio_end_token_id = None
+    processor.mm_tokens = MultimodalSpecialTokens(
+        audio_token="<|audio_pad|>",
+        audio_token_id=5,
+    ).build(SimpleNamespace(tokenizer=processor._tokenizer))
+    request = _request()
+    request.prompt = "Ask <|audio_1|>"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_AUDIO,
+            data_uri="data:audio/wav;base64,AA==",
+        )
+    )
+
+    with pytest.raises(ValueError, match="replacement placeholders"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_AGGREGATED,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+            multimodal_processor=processor,
+        )
+
+
+def test_media_conversion_accepts_native_regex_alias():
+    processor = _multimodal_processor()
+    processor.mm_tokens.image_token_regex = re.compile(r"<image(?:_alias)?>")
+    processor.mm_tokens.combined_regex = None
+    processor.get_unexpanded_mm_token = lambda modality: None
+    request = _request()
+    request.prompt = "Ask <image_alias>"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_IMAGE,
+            data_uri="data:image/png;base64,AA==",
+        )
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=processor,
+    ).request
+
+    assert converted.text == "Ask <image_alias>"
+
+
+def test_media_conversion_does_not_treat_native_pad_token_as_numbered():
+    processor = _multimodal_processor()
+    processor.mm_tokens.image_token = "<|vision_start|><|image_pad|><|vision_end|>"
+    processor.mm_tokens.image_token_regex = re.compile(
+        r"<\|vision_start\|><\|image_pad\|><\|vision_end\|>"
+    )
+    processor.mm_tokens.combined_regex = None
+    processor.get_unexpanded_mm_token = lambda modality: None
+    request = _request()
+    request.prompt = "Ask <|vision_start|><|image_pad|><|vision_end|>"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_IMAGE,
+            data_uri="data:image/png;base64,AA==",
+        )
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=processor,
+    ).request
+
+    assert converted.text == request.prompt
+
+
+def test_media_token_ids_accept_native_regex_alias_without_replacement_hook():
+    processor = _multimodal_processor()
+    processor.mm_tokens.audio_token_regex = re.compile(r"<audio(?:_alias)?>")
+    processor.mm_tokens.combined_regex = None
+    processor.get_unexpanded_mm_token = lambda modality: None
+    request = _request()
+    request.ClearField("prompt")
+    request.token_ids.ids.extend([7, 61, 62])
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_AUDIO,
+            data_uri="data:audio/wav;base64,AA==",
+        )
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=processor,
+    ).request
+
+    assert converted.input_ids == [7, 61, 62]
+
+
+@pytest.mark.parametrize(
+    ("input_kind", "original"),
+    [
+        ("prompt", "<|audio_2|><|image_1|>Ask"),
+        ("token_ids", [7, 8]),
+    ],
+)
+def test_media_conversion_rejects_missing_or_mismatched_placeholders(
+    input_kind, original
+):
+    request = _request()
+    if input_kind == "prompt":
+        request.prompt = original
+    else:
+        request.ClearField("prompt")
+        request.token_ids.ids.extend(original)
+    request.media.extend(
+        [
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                data_uri="data:audio/wav;base64,AA==",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                data_uri="data:image/png;base64,AA==",
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="placeholder"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_AGGREGATED,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+            multimodal_processor=_multimodal_processor(),
+        )
+
+
+def test_media_conversion_rejects_model_without_multimodal_processor():
+    request = _request()
+    request.prompt = "<|audio_1|>Ask"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_AUDIO,
+            data_uri="data:audio/wav;base64,AA==",
+        )
+    )
+
+    with pytest.raises(ValueError, match="does not have a multimodal processor"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_AGGREGATED,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_admission_drains_without_dropping_admitted_requests():
+    admission = ProcessAdmission()
+    await admission.admit("one", "session")
+    await admission.start_drain()
+    with pytest.raises(DrainingError):
+        await admission.admit("two")
+    assert not await admission.wait_empty(timeout=0.01)
+    await admission.finish("one", "session")
+    assert await admission.wait_empty(timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_abort_all_reaches_http_only_requests():
+    runtime = _Runtime()
+    admission = ProcessAdmission()
+    await admission.admit_external()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+
+    response = await servicer.Abort(
+        lifecycle_pb2.AbortRequest(all_requests=lifecycle_pb2.AllRequests()),
+        _Context(),
+    )
+
+    assert response.status == lifecycle_pb2.ABORT_STATUS_ABORTED
+    assert await admission.active_request_ids() == ()
+    assert runtime.aborts == [{"abort_all": True}]
+    await admission.finish_external()
+    await servicer.close()
+
+
+class _LoraResult:
+    def __init__(self, success=True, error_message=""):
+        self.success = success
+        self.error_message = error_message
+
+
+class _LoraManager:
+    def __init__(self):
+        self.loads = []
+        self.unloads = []
+
+    async def load_lora_adapter(self, request, _):
+        self.loads.append(request.lora_name)
+        return _LoraResult()
+
+    async def unload_lora_adapter(self, request, _):
+        self.unloads.append(request.lora_name)
+        return _LoraResult()
+
+
+def _adapter(tmp_path: Path):
+    (tmp_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    return lora_pb2.LoraAdapter(
+        lora_id=7, lora_name="adapter", source_path=str(tmp_path)
+    )
+
+
+@pytest.mark.asyncio
+async def test_lora_is_lazy_and_unload_preserves_admitted_selection(tmp_path):
+    manager = _LoraManager()
+    registry = LoraRegistry(manager)
+    adapter, already = await registry.load(_adapter(tmp_path))
+    assert not already
+    assert manager.loads == []
+
+    await registry.acquire(adapter.lora_name)
+    assert manager.loads == [adapter.lora_name]
+    await registry.unload(adapter.lora_name)
+    with pytest.raises(KeyError):
+        await registry.acquire(adapter.lora_name)
+    assert manager.unloads == []
+    await registry.release(adapter.lora_name)
+    for _ in range(20):
+        if manager.unloads:
+            break
+        await asyncio.sleep(0)
+    assert manager.unloads == [adapter.lora_name]
+    await registry.close()
+
+
+class _Load:
+    def to_dict(self):
+        return {
+            "timestamp": 1.0,
+            "dp_rank": 0,
+            "num_running_reqs": 0,
+            "num_waiting_reqs": 0,
+            "num_waiting_uncached_tokens": 0,
+            "num_used_tokens": 0,
+            "max_total_num_tokens": 1024,
+        }
+
+
+class _TokenizerManager:
+    def __init__(self):
+        self.model_config = SimpleNamespace(context_len=4096)
+        self.mm_processor = None
+        self.lora_loads = []
+        self.lora_unloads = []
+
+    async def generate_request(self, obj, request=None):
+        yield {
+            "text": "Hi",
+            "output_ids": [1],
+            "meta_info": {"finish_reason": None},
+        }
+        yield {
+            "text": "",
+            "output_ids": [],
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+            },
+        }
+
+    async def get_loads(self, dp_rank=None):
+        return [_Load()]
+
+    async def load_lora_adapter(self, request, _):
+        self.lora_loads.append(request.lora_name)
+        return _LoraResult()
+
+    async def unload_lora_adapter(self, request, _):
+        self.lora_unloads.append(request.lora_name)
+        return _LoraResult()
+
+
+class _AbortAcknowledgingTokenizerManager(_TokenizerManager):
+    def __init__(self):
+        super().__init__()
+        self.abort_terminal = asyncio.Event()
+
+    async def generate_request(self, obj, request=None):
+        yield {
+            "text": "Hi",
+            "output_ids": [1],
+            "meta_info": {"finish_reason": None},
+        }
+        await self.abort_terminal.wait()
+        yield {
+            "text": "",
+            "output_ids": [],
+            "meta_info": {
+                "finish_reason": {"type": "abort"},
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+            },
+        }
+
+
+class _Runtime:
+    def __init__(self, *, mode="null"):
+        self.tokenizer_manager = _TokenizerManager()
+        self.server_args = SimpleNamespace(
+            disaggregation_mode=mode,
+            host="0.0.0.0",
+            openengine_advertise_host=None,
+            served_model_name="served",
+            model_path="canonical",
+            tokenizer_path="canonical",
+            tokenizer_mode="auto",
+            skip_tokenizer_init=False,
+            reasoning_parser=None,
+            tool_call_parser=None,
+            enable_lora=False,
+            dp_size=2,
+            tp_size=2,
+            pp_size=1,
+            page_size=16,
+            max_running_requests=32,
+            max_prefill_tokens=4096,
+            max_loaded_loras=None,
+            max_loras_per_batch=1,
+            enable_priority_scheduling=True,
+            grammar_backend="xgrammar",
+            schedule_policy="fcfs",
+            disaggregation_transfer_backend="nixl",
+            disaggregation_bootstrap_port=8998,
+            describe_kv_events_publisher=lambda: {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 16,
+                "dp_size": 2,
+            },
+        )
+        self.scheduler_info = {"max_total_num_tokens": 1024}
+        self.aborts = []
+
+    def abort(self, **kwargs):
+        self.aborts.append(kwargs)
+
+    def health_check(self):
+        return True
+
+
+class _AbortFailingRuntime(_Runtime):
+    def abort(self, **kwargs):
+        self.aborts.append(kwargs)
+        raise RuntimeError("scheduler abort failed")
+
+
+def test_advertised_host_prefers_injected_pod_ip(monkeypatch):
+    runtime = _Runtime(mode="prefill")
+    monkeypatch.setenv("POD_IP", "10.42.3.17")
+    assert resolve_advertised_host(runtime, "127.0.0.1") == "10.42.3.17"
+    monkeypatch.setenv("OPENENGINE_ADVERTISED_HOST", "prefill.example")
+    assert resolve_advertised_host(runtime, "0.0.0.0") == "prefill.example"
+
+
+@pytest.mark.asyncio
+async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
+    runtime = _Runtime()
+    servicer = OpenEngineServicer(
+        runtime,
+        ProcessAdmission(),
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    responses = [
+        response async for response in servicer.Generate(_request(), _Context())
+    ]
+    assert [response.WhichOneof("event") for response in responses] == [
+        "token",
+        "finished",
+    ]
+    assert responses[-1].usage.total_tokens == 3
+    assert runtime.aborts == []
+
+    server_info = await servicer.GetServerInfo(None, _Context())
+    assert server_info.schema_revision == 3
+    assert server_info.schema_release == OPENENGINE_COMMIT
+    assert list(server_info.supported_models) == ["served"]
+    assert server_info.kv_connector.enabled is False
+    assert server_info.kv_connector.handoff_profile == ""
+    model_info = await servicer.GetModelInfo(
+        model_pb2.GetModelInfoRequest(model="served"), _Context()
+    )
+    assert model_info.model_id == "canonical"
+    assert list(model_info.served_model_aliases) == ["canonical"]
+    assert model_info.tokenizer.source == "canonical"
+    sources = await servicer.GetKvEventSources(
+        kv_pb2.GetKvEventSourcesRequest(), _Context()
+    )
+    assert [
+        (source.data_parallel_rank, source.endpoint_addr.port)
+        for source in sources.sources
+    ] == [
+        (0, 5557),
+        (1, 5558),
+    ]
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
+    assert load.total_kv_blocks == 64
+    await servicer.close()
+
+
+def test_kv_source_discovery_fails_closed_for_nonstandard_cache(caplog):
+    async def check():
+        runtime = _Runtime()
+        runtime.server_args.enable_flexkv = True
+        servicer = OpenEngineServicer(
+            runtime,
+            ProcessAdmission(),
+            advertised_host="127.0.0.1",
+            instance_id="instance",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            sources = await servicer.GetKvEventSources(
+                kv_pb2.GetKvEventSourcesRequest(), _Context()
+            )
+
+        assert not sources.sources
+        assert "unsupported cache mode enable_flexkv" in caplog.text
+        await servicer.close()
+
+    asyncio.run(check())
+
+
+@pytest.mark.asyncio
+async def test_servicer_logs_completed_lazy_lora_selection(tmp_path, caplog):
+    runtime = _Runtime()
+    runtime.server_args.enable_lora = True
+    runtime.server_args.dp_size = 1
+    servicer = OpenEngineServicer(
+        runtime,
+        ProcessAdmission(),
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    await servicer.LoadLora(
+        lora_pb2.LoadLoraRequest(adapter=_adapter(tmp_path)), _Context()
+    )
+    request = _request("lora-request")
+    request.lora_name = "adapter"
+    with caplog.at_level(logging.INFO):
+        responses = [
+            response async for response in servicer.Generate(request, _Context())
+        ]
+    evidence = [
+        json.loads(record.message.removeprefix("OpenEngine LoRA selection "))
+        for record in caplog.records
+        if "OpenEngine LoRA selection" in record.message
+    ]
+    assert [value["phase"] for value in evidence] == ["selected", "complete"]
+    assert all(value["lora_name"] == "adapter" for value in evidence)
+    assert all(value["request_id"] == "lora-request" for value in evidence)
+    assert runtime.tokenizer_manager.lora_loads == ["adapter"]
+    assert responses[-1].usage.total_tokens == 3
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_dropped_parallel_stream_aborts_every_engine_request():
+    runtime = _Runtime()
+    servicer = OpenEngineServicer(
+        runtime,
+        ProcessAdmission(),
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    request = _request("parallel")
+    request.sampling.num_sequences = 2
+    stream = servicer.Generate(request, _Context())
+    first = await anext(stream)
+    assert first.token.output_index in (0, 1)
+    await stream.aclose()
+
+    assert len(runtime.aborts) == 2
+    assert all(
+        value["rid"].startswith("parallel.openengine.") for value in runtime.aborts
+    )
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_all_parallel_abort_terminals():
+    runtime = _Runtime()
+    runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
+    admission = ProcessAdmission()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    request = _request("parallel-gated")
+    request.sampling.num_sequences = 2
+    stream = servicer.Generate(request, _Context())
+    await anext(stream)
+    await stream.aclose()
+
+    async def collect_drain():
+        return [
+            response
+            async for response in servicer.Drain(
+                lifecycle_pb2.DrainRequest(stop_accepting_new_requests=True),
+                _Context(),
+            )
+        ]
+
+    drain_task = asyncio.create_task(collect_drain())
+    await asyncio.sleep(0.01)
+    assert await admission.snapshot() == (1, 0)
+    assert not drain_task.done()
+    assert len(runtime.aborts) == 2
+
+    runtime.tokenizer_manager.abort_terminal.set()
+    updates = await asyncio.wait_for(drain_task, timeout=1)
+    assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
+    assert await admission.snapshot() == (0, 0)
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_abort_signal_failure_retains_admission_until_engine_terminal():
+    runtime = _AbortFailingRuntime()
+    runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
+    admission = ProcessAdmission()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    stream = servicer.Generate(_request("abort-failure"), _Context())
+    await anext(stream)
+    await stream.aclose()
+
+    assert runtime.aborts == [{"rid": "abort-failure"}]
+    assert await admission.snapshot() == (1, 0)
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
+    assert load.running_requests == 1
+
+    async def collect_drain():
+        return [
+            response
+            async for response in servicer.Drain(
+                lifecycle_pb2.DrainRequest(stop_accepting_new_requests=True),
+                _Context(),
+            )
+        ]
+
+    drain_task = asyncio.create_task(collect_drain())
+    await asyncio.sleep(0.01)
+    assert not drain_task.done()
+
+    runtime.tokenizer_manager.abort_terminal.set()
+    updates = await asyncio.wait_for(drain_task, timeout=1)
+    assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
+    assert await admission.snapshot() == (0, 0)
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
+    assert load.running_requests == 0
+    await servicer.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_holds_lora_lease_until_abort_terminal(tmp_path):
+    runtime = _Runtime()
+    runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
+    runtime.server_args.enable_lora = True
+    runtime.server_args.dp_size = 1
+    admission = ProcessAdmission()
+    servicer = OpenEngineServicer(
+        runtime,
+        admission,
+        advertised_host="127.0.0.1",
+        instance_id="instance",
+    )
+    await servicer.LoadLora(
+        lora_pb2.LoadLoraRequest(adapter=_adapter(tmp_path)), _Context()
+    )
+    request = _request("lora-gated")
+    request.lora_name = "adapter"
+    stream = servicer.Generate(request, _Context())
+    await anext(stream)
+    await stream.aclose()
+    await servicer.UnloadLora(
+        lora_pb2.UnloadLoraRequest(lora_name="adapter"), _Context()
+    )
+
+    await asyncio.sleep(0.01)
+    assert runtime.tokenizer_manager.lora_unloads == []
+    assert await admission.snapshot() == (1, 0)
+
+    runtime.tokenizer_manager.abort_terminal.set()
+    assert await admission.wait_empty(timeout=1)
+    for _ in range(20):
+        if runtime.tokenizer_manager.lora_unloads:
+            break
+        await asyncio.sleep(0)
+    assert runtime.tokenizer_manager.lora_unloads == ["adapter"]
+    await servicer.close()

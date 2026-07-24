@@ -185,6 +185,11 @@ class BaseMultimodalProcessor(ABC):
     auto_mm_io_worker_num = 4
     supports_mm_processor_concurrency = False
 
+    def get_unexpanded_mm_token(self, modality: Modality) -> Optional[str]:
+        """Return the native marker used before multimodal token expansion."""
+        marker = getattr(self.mm_tokens, f"{modality.name.lower()}_token", None)
+        return marker if isinstance(marker, str) and marker else None
+
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):

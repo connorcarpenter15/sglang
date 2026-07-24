@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 class Phi4MMProcessorAdapter(ProcessorMixin):
     def __init__(self, _processor) -> None:
         self._processor = _processor
+        # BaseMultimodalProcessor must tokenize fallback text with the real
+        # tokenizer, not by calling this keyword-only processor adapter as if
+        # it were a tokenizer.
+        self.tokenizer = _processor.tokenizer
 
     def __call__(self, **kwargs):
         result = self._processor(**kwargs)
