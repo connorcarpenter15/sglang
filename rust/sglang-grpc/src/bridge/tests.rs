@@ -54,26 +54,26 @@ async fn stale_request_key_cannot_abort_reused_request_id() {
 }
 
 #[test]
-fn explicit_abort_keeps_typed_channel_until_python_sends_terminals() {
-    let (typed_sender, _typed_receiver) = tokio::sync::mpsc::channel(1);
-    let typed_key = RequestKey {
-        rid: "typed".to_string(),
+fn explicit_abort_keeps_generate_channel_until_python_sends_terminals() {
+    let (generate_sender, _generate_receiver) = tokio::sync::mpsc::channel(1);
+    let generate_key = RequestKey {
+        rid: "generate".to_string(),
         incarnation: 1,
     };
     let mut state = BridgeState::default();
     state.channels.insert(
-        typed_key.rid.clone(),
+        generate_key.rid.clone(),
         ActiveChannel {
-            incarnation: typed_key.incarnation,
-            sender: typed_sender,
-            metadata_mode: ResponseMetadataMode::TypedGenerate,
+            incarnation: generate_key.incarnation,
+            sender: generate_sender,
+            metadata_mode: ResponseMetadataMode::Generate,
         },
     );
 
-    finalize_explicit_abort_locked(&mut state, &typed_key);
+    finalize_explicit_abort_locked(&mut state, &generate_key);
 
-    assert!(state.channels.contains_key(typed_key.rid()));
-    assert!(!state.terminal_errors.contains_key(&typed_key));
+    assert!(state.channels.contains_key(generate_key.rid()));
+    assert!(!state.terminal_errors.contains_key(&generate_key));
 
     let (legacy_sender, _legacy_receiver) = tokio::sync::mpsc::channel(1);
     let legacy_key = RequestKey {
@@ -99,7 +99,7 @@ fn explicit_abort_keeps_typed_channel_until_python_sends_terminals() {
 }
 
 #[test]
-fn metadata_modes_preserve_legacy_json_and_parse_typed_values() {
+fn generate_metadata_preserves_legacy_json_and_parses_typed_values() {
     Python::initialize();
     Python::attach(|py| {
         let chunk = PyDict::new(py);
@@ -108,8 +108,13 @@ fn metadata_modes_preserve_legacy_json_and_parse_typed_values() {
         meta.set_item("text", "hello").unwrap();
         meta.set_item("array", vec![1, 2]).unwrap();
         chunk.set_item("meta_info", meta).unwrap();
+        let legacy_meta = PyDict::new(py);
+        legacy_meta.set_item("number", 7).unwrap();
+        legacy_meta.set_item("text", "hello").unwrap();
+        legacy_meta.set_item("array", vec![1, 2]).unwrap();
+        chunk.set_item("legacy_meta_info", legacy_meta).unwrap();
 
-        let legacy = extract_legacy_meta_info(&chunk);
+        let legacy = extract_legacy_generate_meta_info(&chunk);
         assert_eq!(legacy["number"], "7");
         assert_eq!(legacy["text"], "\"hello\"");
         assert_eq!(legacy["array"], "[1, 2]");

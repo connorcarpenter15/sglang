@@ -7,7 +7,6 @@ service SglangService {
   // SGLang-native RPCs (typed proto)
   rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
-  rpc TypedGenerate(GenerateRequest) returns (stream TypedGenerateResponse);
   rpc TextEmbed(TextEmbedRequest) returns (TextEmbedResponse);
   rpc Embed(EmbedRequest) returns (EmbedResponse);
   rpc Classify(ClassifyRequest) returns (ClassifyResponse);
@@ -136,18 +135,15 @@ message GenerateResponse {
   repeated int32 output_ids = 1;
   map<string, string> meta_info = 2;
   bool finished = 3;
-}
-
-message TypedGenerateResponse {
-  string request_id = 1;
-  int32 choice_index = 2;
-  repeated int32 delta_output_ids = 3;
-  optional Logprobs logprobs = 4;
-  optional Usage usage = 5;
-  google.protobuf.Struct engine_metadata = 6;
+  string request_id = 4;
+  int32 choice_index = 5;
+  repeated int32 delta_output_ids = 6;
+  optional Logprobs logprobs = 7;
+  optional Usage usage = 8;
+  google.protobuf.Struct engine_metadata = 9;
   oneof terminal {
-    GenerationFinish finish = 7;
-    GenerationError error = 8;
+    GenerationFinish finish = 10;
+    GenerationError error = 11;
   }
 }
 

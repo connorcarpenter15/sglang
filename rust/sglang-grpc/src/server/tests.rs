@@ -1,6 +1,6 @@
 use super::{
     ChoiceTracker, DEFAULT_GRPC_MAX_MESSAGE_SIZE, TypedTerminal, expected_generation_choices,
-    openai_status_code, resolve_max_message_size, terminal_error_status, typed_generation_chunk,
+    generation_chunk, openai_status_code, resolve_max_message_size, terminal_error_status,
 };
 use crate::bridge::{ResponseData, ResponseMetadata, TerminalError};
 use prost::Message;
@@ -48,6 +48,9 @@ fn legacy_generation_wire_fields_remain_compatible() {
     assert_eq!(decoded_response.output_ids, legacy_response.output_ids);
     assert_eq!(decoded_response.meta_info, legacy_response.meta_info);
     assert!(decoded_response.finished);
+    assert!(decoded_response.request_id.is_empty());
+    assert!(decoded_response.delta_output_ids.is_empty());
+    assert!(decoded_response.terminal.is_none());
 }
 
 #[test]
@@ -74,11 +77,15 @@ fn openai_status_code_falls_back_when_missing_or_invalid() {
 fn response_data(output_ids: Vec<i32>, text: &str, meta_info: serde_json::Value) -> ResponseData {
     ResponseData {
         text: Some(text.to_string()),
+        legacy_output_ids: Some(output_ids.clone()),
         output_ids: Some(output_ids),
         embedding: None,
         choice_index: 1,
         json_bytes: None,
-        meta_info: ResponseMetadata::Typed(serde_json::from_value(meta_info).unwrap()),
+        meta_info: ResponseMetadata::Generate {
+            legacy: std::collections::HashMap::new(),
+            typed: serde_json::from_value(meta_info).unwrap(),
+        },
     }
 }
 
@@ -119,7 +126,7 @@ fn typed_logprobs_are_aligned_with_delta_tokens() {
         "output_token_logprobs": [[-0.2, 20, "a"]],
         "output_top_logprobs": [[[-0.2, 20, "a"], [-1.2, 21, "b"]]]
     });
-    let first = typed_generation_chunk(response_data(vec![20], "a", metadata), false).unwrap();
+    let first = generation_chunk(response_data(vec![20], "a", metadata), false).unwrap();
     let logprobs = first.logprobs.unwrap();
     assert_eq!(logprobs.prompt.len(), 1);
     assert_eq!(logprobs.output.len(), first.delta_output_ids.len());
@@ -128,7 +135,7 @@ fn typed_logprobs_are_aligned_with_delta_tokens() {
 
 #[test]
 fn prompt_logprobs_do_not_require_output_logprobs() {
-    let chunk = typed_generation_chunk(
+    let chunk = generation_chunk(
         response_data(
             vec![],
             "",
@@ -146,7 +153,7 @@ fn prompt_logprobs_do_not_require_output_logprobs() {
 
 #[test]
 fn malformed_logprobs_are_rejected() {
-    let error = typed_generation_chunk(
+    let error = generation_chunk(
         response_data(
             vec![1],
             "a",
@@ -165,7 +172,7 @@ fn finish_reasons_preserve_string_and_token_stops() {
         (serde_json::json!("END"), Some("END"), None),
         (serde_json::json!(42), None, Some(42)),
     ] {
-        let chunk = typed_generation_chunk(
+        let chunk = generation_chunk(
             response_data(
                 vec![],
                 "",
@@ -193,7 +200,7 @@ fn finish_reasons_preserve_string_and_token_stops() {
 
 #[test]
 fn terminal_metadata_is_typed_and_not_duplicated_in_extensions() {
-    let chunk = typed_generation_chunk(
+    let chunk = generation_chunk(
         response_data(
             vec![7],
             "done",
@@ -222,8 +229,8 @@ fn terminal_metadata_is_typed_and_not_duplicated_in_extensions() {
 }
 
 #[test]
-fn typed_response_uses_the_rust_owned_public_request_id() {
-    let chunk = typed_generation_chunk(
+fn generate_response_uses_the_rust_owned_public_request_id() {
+    let chunk = generation_chunk(
         response_data(
             vec![7],
             "done",
@@ -236,9 +243,12 @@ fn typed_response_uses_the_rust_owned_public_request_id() {
     )
     .unwrap();
     assert!(chunk.usage.is_none());
-    let response = chunk.into_response("public-parent-rid".into());
+    let response = chunk.into_response("public-parent-rid".into(), true);
 
     assert_eq!(response.request_id, "public-parent-rid");
+    assert_eq!(response.output_ids, vec![7]);
+    assert_eq!(response.delta_output_ids, vec![7]);
+    assert!(response.finished);
     assert!(
         !response
             .engine_metadata
@@ -247,7 +257,7 @@ fn typed_response_uses_the_rust_owned_public_request_id() {
 }
 
 #[test]
-fn typed_generation_rejects_invalid_or_unbounded_choice_counts() {
+fn generation_rejects_invalid_or_unbounded_choice_counts() {
     let request_with_n = |n| crate::proto::GenerateRequest {
         sampling_params: Some(crate::proto::SamplingParams {
             n: Some(n),
@@ -269,7 +279,7 @@ fn typed_generation_rejects_invalid_or_unbounded_choice_counts() {
 
 #[test]
 fn aborts_become_typed_generation_errors() {
-    let chunk = typed_generation_chunk(
+    let chunk = generation_chunk(
         response_data(
             vec![],
             "",

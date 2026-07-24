@@ -514,7 +514,9 @@ fn generation_terminal(meta: &serde_json::Map<String, serde_json::Value>) -> Typ
     })
 }
 
-struct TypedGenerationChunk {
+struct GenerationChunk {
+    legacy_output_ids: Vec<i32>,
+    legacy_meta_info: HashMap<String, String>,
     choice_index: i32,
     delta_output_ids: Vec<i32>,
     logprobs: Option<proto::Logprobs>,
@@ -523,15 +525,16 @@ struct TypedGenerationChunk {
     terminal: Option<TypedTerminal>,
 }
 
-impl TypedGenerationChunk {
-    fn into_response(self, request_id: String) -> proto::TypedGenerateResponse {
+impl GenerationChunk {
+    fn into_response(self, request_id: String, finished: bool) -> proto::GenerateResponse {
         let terminal = self.terminal.map(|terminal| match terminal {
-            TypedTerminal::Finish(finish) => {
-                proto::typed_generate_response::Terminal::Finish(finish)
-            }
-            TypedTerminal::Error(error) => proto::typed_generate_response::Terminal::Error(error),
+            TypedTerminal::Finish(finish) => proto::generate_response::Terminal::Finish(finish),
+            TypedTerminal::Error(error) => proto::generate_response::Terminal::Error(error),
         });
-        proto::TypedGenerateResponse {
+        proto::GenerateResponse {
+            output_ids: self.legacy_output_ids,
+            meta_info: self.legacy_meta_info,
+            finished,
             request_id,
             delta_output_ids: self.delta_output_ids,
             choice_index: self.choice_index,
@@ -543,19 +546,20 @@ impl TypedGenerationChunk {
     }
 }
 
-fn typed_generation_chunk(
+fn generation_chunk(
     data: crate::bridge::ResponseData,
     choice_terminal: bool,
-) -> Result<TypedGenerationChunk, String> {
+) -> Result<GenerationChunk, String> {
     let crate::bridge::ResponseData {
         output_ids,
+        legacy_output_ids,
         choice_index,
         meta_info,
         ..
     } = data;
-    let meta_info = meta_info.as_typed()?;
+    let (legacy_meta_info, meta_info) = meta_info.into_generate()?;
     let delta_output_ids = output_ids.unwrap_or_default();
-    let logprobs = logprobs_from_meta(meta_info)?;
+    let logprobs = logprobs_from_meta(&meta_info)?;
     let usage_keys = [
         "prompt_tokens",
         "input_tokens",
@@ -566,24 +570,26 @@ fn typed_generation_chunk(
     ];
     let usage = (choice_terminal && usage_keys.iter().any(|key| meta_info.contains_key(*key)))
         .then(|| {
-            let prompt_tokens = meta_u64(meta_info, &["prompt_tokens", "input_tokens"]);
-            let completion_tokens = meta_u64(meta_info, &["completion_tokens", "output_tokens"]);
+            let prompt_tokens = meta_u64(&meta_info, &["prompt_tokens", "input_tokens"]);
+            let completion_tokens = meta_u64(&meta_info, &["completion_tokens", "output_tokens"]);
             proto::Usage {
                 prompt_tokens,
                 completion_tokens,
                 cached_prompt_tokens: meta_u64(
-                    meta_info,
+                    &meta_info,
                     &["cached_tokens", "cached_prompt_tokens"],
                 ),
             }
         });
-    Ok(TypedGenerationChunk {
+    Ok(GenerationChunk {
+        legacy_output_ids: legacy_output_ids.unwrap_or_else(|| delta_output_ids.clone()),
+        legacy_meta_info,
         choice_index,
         delta_output_ids,
         logprobs,
         usage,
-        engine_metadata: engine_metadata(meta_info),
-        terminal: choice_terminal.then(|| generation_terminal(meta_info)),
+        engine_metadata: engine_metadata(&meta_info),
+        terminal: choice_terminal.then(|| generation_terminal(&meta_info)),
     })
 }
 
@@ -691,104 +697,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
-
-        let SubmittedRequest { key, mut receiver } = self
-            .bridge
-            .submit_request(
-                &rid,
-                "generate",
-                req_dict,
-                ResponseMetadataMode::LegacyStringMap,
-            )
-            .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
-
-        let bridge = self.bridge.clone();
-        let response_timeout = self.response_timeout;
-
-        let stream = async_stream::stream! {
-            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), key.clone());
-            loop {
-                match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Stream chunk timed out".to_string()).await {
-                    Ok(Some(ResponseChunk::Data(data))) => {
-                        let meta_info = match legacy_metadata(data.meta_info) {
-                            Ok(meta_info) => meta_info,
-                            Err(status) => {
-                                abort_guard.abort_now();
-                                yield Err(*status);
-                                break;
-                            }
-                        };
-                        yield Ok(proto::GenerateResponse {
-                            output_ids: data.output_ids.unwrap_or_default(),
-                            meta_info,
-                            finished: false,
-                        });
-                    }
-                    Ok(Some(ResponseChunk::Finished(data))) => {
-                        abort_guard.disarm();
-                        let meta_info = match legacy_metadata(data.meta_info) {
-                            Ok(meta_info) => meta_info,
-                            Err(status) => {
-                                yield Err(*status);
-                                break;
-                            }
-                        };
-                        yield Ok(proto::GenerateResponse {
-                            output_ids: data.output_ids.unwrap_or_default(),
-                            meta_info,
-                            finished: true,
-                        });
-                        break;
-                    }
-                    Ok(Some(ResponseChunk::Error(msg))) => {
-                        abort_guard.disarm();
-                        yield Err(Status::internal(msg));
-                        break;
-                    }
-                    Ok(None) => {
-                        let (status, should_abort) = closed_stream_status(&bridge, &key);
-                        if should_abort {
-                            abort_guard.abort_now();
-                        } else {
-                            abort_guard.disarm();
-                        }
-                        yield Err(status);
-                        break;
-                    }
-                    Err(status) => {
-                        abort_guard.abort_now();
-                        yield Err(status);
-                        break;
-                    }
-                }
-            }
-        };
-
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    type TypedGenerateStream = StreamResult<proto::TypedGenerateResponse>;
-
-    async fn typed_generate(
-        &self,
-        request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::TypedGenerateStream>, Status> {
-        let req = request.into_inner();
-        let rid = req
-            .rid
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
         let expected_choices = expected_generation_choices(&req).map_err(|status| *status)?;
 
         let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(
-                &rid,
-                "generate",
-                req_dict,
-                ResponseMetadataMode::TypedGenerate,
-            )
+            .submit_request(&rid, "generate", req_dict, ResponseMetadataMode::Generate)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
@@ -799,7 +712,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             let mut abort_guard = RequestAbortGuard::new(bridge.clone(), key.clone());
             let mut choices = ChoiceTracker::new(expected_choices);
             loop {
-                match recv_chunk_with_timeout(&mut receiver, response_timeout, || "TypedGenerate stream chunk timed out".to_string()).await {
+                match recv_chunk_with_timeout(&mut receiver, response_timeout, || "Generate stream chunk timed out".to_string()).await {
                     Ok(Some(chunk @ (ResponseChunk::Data(_) | ResponseChunk::Finished(_)))) => {
                         let request_finished = matches!(&chunk, ResponseChunk::Finished(_));
                         let data = match chunk {
@@ -819,7 +732,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             choice_index,
                             choice_terminal,
                             request_finished,
-                            "TypedGenerate",
+                            "Generate",
                         ) {
                             Ok(all_terminal) => all_terminal,
                             Err(error) => {
@@ -828,8 +741,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                                 break;
                             }
                         };
-                        let mapped = match typed_generation_chunk(data, choice_terminal) {
-                            Ok(mapped) => mapped.into_response(rid_clone.clone()),
+                        let mapped = match generation_chunk(data, choice_terminal) {
+                            Ok(mapped) => mapped.into_response(rid_clone.clone(), request_finished),
                             Err(error) => {
                                 abort_guard.abort_now();
                                 yield Err(Status::internal(error));

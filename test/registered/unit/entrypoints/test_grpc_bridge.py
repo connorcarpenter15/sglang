@@ -172,6 +172,12 @@ async def test_typed_streaming_normalizes_cumulative_choices_before_callback():
         [11],
         [21],
     ]
+    assert [call[0]["legacy_output_ids"] for call in callback.calls] == [
+        [10],
+        [20],
+        [10, 11],
+        [20, 21],
+    ]
     assert [
         len(call[0]["meta_info"]["output_token_logprobs"]) for call in callback.calls
     ] == [1, 1, 1, 1]
@@ -212,6 +218,10 @@ async def test_typed_incremental_stream_preserves_output_deltas():
     await runtime._run_generate(obj, callback, True, None, typed_generation=True)
 
     assert [call[0]["output_ids"] for call in callback.calls] == [[10], [11]]
+    assert [call[0]["legacy_output_ids"] for call in callback.calls] == [
+        [10],
+        [10, 11],
+    ]
     assert [
         call[0]["meta_info"]["output_token_logprobs"] for call in callback.calls
     ] == [[[-0.2, 10, "10"]], [[-0.3, 11, "11"]]]

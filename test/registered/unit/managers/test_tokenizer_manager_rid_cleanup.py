@@ -550,6 +550,7 @@ class TestParallelAbortRouting(CustomTestCase):
         self.assertEqual(request.rid, "")
         self.assertTrue(request.abort_all)
 
+
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
         tm = _make_tokenizer_manager()

@@ -461,7 +461,7 @@ class RuntimeHandle:
         expected_choices = max(1, int(sampling_params.get("n", 1)))
         terminal_choices = set()
         try:
-            if stream or typed_generation:
+            if stream or typed_generation or expected_choices > 1:
                 ready_event = self._install_on_ready(chunk_callback)
             gen = self.tokenizer_manager.generate_request(
                 obj,
@@ -481,7 +481,7 @@ class RuntimeHandle:
                 }
                 legacy_output_ids = (
                     {index: [] for index in range(expected_choices)}
-                    if incremental and not typed_generation
+                    if incremental
                     else None
                 )
                 async for chunk in gen:
@@ -513,6 +513,19 @@ class RuntimeHandle:
                             offsets[choice_index],
                             incremental=incremental,
                         )
+                        callback_chunk["legacy_meta_info"] = chunk.get("meta_info") or {}
+                        if incremental:
+                            assert legacy_output_ids is not None
+                            legacy_output_ids[choice_index].extend(
+                                chunk.get("output_ids") or []
+                            )
+                            callback_chunk["legacy_output_ids"] = list(
+                                legacy_output_ids[choice_index]
+                            )
+                        else:
+                            callback_chunk["legacy_output_ids"] = list(
+                                chunk.get("output_ids") or []
+                            )
                     elif incremental:
                         assert legacy_output_ids is not None
                         legacy_output_ids[choice_index].extend(
@@ -552,11 +565,20 @@ class RuntimeHandle:
                     )
                     return
                 for index, item in enumerate(results):
-                    item.setdefault("index", index)
+                    callback_item = item
+                    if typed_generation:
+                        callback_item = dict(item)
+                        callback_item["legacy_output_ids"] = list(
+                            item.get("output_ids") or []
+                        )
+                        callback_item["legacy_meta_info"] = (
+                            item.get("meta_info") or {}
+                        )
+                    callback_item.setdefault("index", index)
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
-                        item,
+                        callback_item,
                         finished=index == len(results) - 1,
                         timeout_abort_rid=obj.rid,
                     )

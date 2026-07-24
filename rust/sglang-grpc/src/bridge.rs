@@ -28,6 +28,7 @@ impl ResponseChunk {
 pub struct ResponseData {
     pub text: Option<String>,
     pub output_ids: Option<Vec<i32>>,
+    pub legacy_output_ids: Option<Vec<i32>>,
     pub embedding: Option<Vec<f32>>,
     pub choice_index: i32,
     pub json_bytes: Option<Vec<u8>>,
@@ -37,21 +38,39 @@ pub struct ResponseData {
 #[derive(Debug, Clone)]
 pub enum ResponseMetadata {
     Legacy(HashMap<String, String>),
-    Typed(serde_json::Map<String, serde_json::Value>),
+    Generate {
+        legacy: HashMap<String, String>,
+        typed: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 impl ResponseMetadata {
     pub fn into_legacy(self) -> Result<HashMap<String, String>, &'static str> {
         match self {
             Self::Legacy(meta) => Ok(meta),
-            Self::Typed(_) => Err("expected legacy string metadata"),
+            Self::Generate { legacy, .. } => Ok(legacy),
         }
     }
 
     pub fn as_typed(&self) -> Result<&serde_json::Map<String, serde_json::Value>, &'static str> {
         match self {
-            Self::Typed(meta) => Ok(meta),
+            Self::Generate { typed, .. } => Ok(typed),
             Self::Legacy(_) => Err("expected typed JSON metadata"),
+        }
+    }
+
+    pub fn into_generate(
+        self,
+    ) -> Result<
+        (
+            HashMap<String, String>,
+            serde_json::Map<String, serde_json::Value>,
+        ),
+        &'static str,
+    > {
+        match self {
+            Self::Generate { legacy, typed } => Ok((legacy, typed)),
+            Self::Legacy(_) => Err("expected combined Generate metadata"),
         }
     }
 }
@@ -59,7 +78,7 @@ impl ResponseMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResponseMetadataMode {
     LegacyStringMap,
-    TypedGenerate,
+    Generate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -274,7 +293,7 @@ impl PyBridge {
             kwargs.set_item("chunk_callback", callback)?;
             kwargs.set_item(
                 "typed_generation",
-                metadata_mode == ResponseMetadataMode::TypedGenerate,
+                metadata_mode == ResponseMetadataMode::Generate,
             )?;
 
             self.runtime_handle
@@ -602,7 +621,7 @@ fn remove_channel_refs_locked(state: &mut BridgeState, key: &RequestKey) -> bool
 fn finalize_explicit_abort_locked(state: &mut BridgeState, key: &RequestKey) {
     let expects_typed_terminals = state.channels.get(key.rid()).is_some_and(|channel| {
         channel.incarnation == key.incarnation
-            && channel.metadata_mode == ResponseMetadataMode::TypedGenerate
+            && channel.metadata_mode == ResponseMetadataMode::Generate
     });
     if expects_typed_terminals {
         return;
@@ -824,6 +843,10 @@ impl ChunkCallback {
             .get_item("output_ids")?
             .and_then(|v| v.extract::<Vec<i32>>().ok());
 
+        let legacy_output_ids: Option<Vec<i32>> = chunk
+            .get_item("legacy_output_ids")?
+            .and_then(|v| v.extract::<Vec<i32>>().ok());
+
         let embedding: Option<Vec<f32>> = chunk
             .get_item("embedding")?
             .and_then(|v| v.extract::<Vec<f32>>().ok());
@@ -837,14 +860,16 @@ impl ChunkCallback {
             ResponseMetadataMode::LegacyStringMap => {
                 ResponseMetadata::Legacy(extract_legacy_meta_info(chunk))
             }
-            ResponseMetadataMode::TypedGenerate => {
-                ResponseMetadata::Typed(extract_typed_meta_info(chunk))
-            }
+            ResponseMetadataMode::Generate => ResponseMetadata::Generate {
+                legacy: extract_legacy_generate_meta_info(chunk),
+                typed: extract_typed_meta_info(chunk),
+            },
         };
 
         let data = ResponseData {
             text,
             output_ids,
+            legacy_output_ids,
             embedding,
             choice_index,
             json_bytes: None,
@@ -935,6 +960,7 @@ impl JsonChunkCallback {
         let data = ResponseData {
             text: None,
             output_ids: None,
+            legacy_output_ids: None,
             embedding: None,
             choice_index: 0,
             json_bytes: Some(bytes_data),
@@ -978,8 +1004,21 @@ fn extract_typed_meta_info(
 }
 
 fn extract_legacy_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
+    extract_meta_info_field(chunk, "meta_info")
+}
+
+fn extract_legacy_generate_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
+    let meta = extract_meta_info_field(chunk, "legacy_meta_info");
+    if meta.is_empty() {
+        extract_legacy_meta_info(chunk)
+    } else {
+        meta
+    }
+}
+
+fn extract_meta_info_field(chunk: &Bound<'_, PyDict>, field: &str) -> HashMap<String, String> {
     let mut meta = HashMap::new();
-    if let Ok(Some(meta_obj)) = chunk.get_item("meta_info")
+    if let Ok(Some(meta_obj)) = chunk.get_item(field)
         && let Ok(meta_dict) = meta_obj.cast::<PyDict>()
     {
         for (k, v) in meta_dict.iter() {
