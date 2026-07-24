@@ -7,12 +7,10 @@ from types import SimpleNamespace
 import pytest
 from openengine.v1 import (
     generation_pb2,
-    input_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
     model_pb2,
-    observability_pb2,
     server_pb2,
 )
 
@@ -157,17 +155,17 @@ def test_media_order_and_raw_bytes_survive_conversion():
     request = _request()
     request.media.extend(
         [
-            input_pb2.MediaItem(
-                modality=input_pb2.MODALITY_IMAGE,
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
                 data_uri="data:image/png;base64,AA==",
             ),
-            input_pb2.MediaItem(
-                modality=input_pb2.MODALITY_VIDEO,
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
                 raw_bytes=b"video",
                 mime_type="video/mp4",
             ),
-            input_pb2.MediaItem(
-                modality=input_pb2.MODALITY_IMAGE,
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
                 url="https://example.test/image.png",
             ),
         ]
@@ -436,6 +434,8 @@ async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
     assert server_info.schema_revision == 3
     assert server_info.schema_release == OPENENGINE_COMMIT
     assert list(server_info.supported_models) == ["served"]
+    assert server_info.kv_connector.enabled is False
+    assert server_info.kv_connector.handoff_profile == ""
     model_info = await servicer.GetModelInfo(
         model_pb2.GetModelInfoRequest(model="served"), _Context()
     )
@@ -452,7 +452,7 @@ async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
         (0, 5557),
         (1, 5558),
     ]
-    load = await servicer.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
     assert load.total_kv_blocks == 64
     await servicer.close()
 
@@ -592,7 +592,7 @@ async def test_abort_signal_failure_retains_admission_until_engine_terminal():
 
     assert runtime.aborts == [{"rid": "abort-failure"}]
     assert await admission.snapshot() == (1, 0)
-    load = await servicer.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
     assert load.running_requests == 1
 
     async def collect_drain():
@@ -612,7 +612,7 @@ async def test_abort_signal_failure_retains_admission_until_engine_terminal():
     updates = await asyncio.wait_for(drain_task, timeout=1)
     assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
     assert await admission.snapshot() == (0, 0)
-    load = await servicer.GetLoad(observability_pb2.GetLoadRequest(), _Context())
+    load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
     assert load.running_requests == 0
     await servicer.close()
 

@@ -97,7 +97,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
-openengine = ["openengine-proto @ git+https://github.com/ai-dynamo/openengine.git@b0cf2a4826d246192dc65b055dab6d2b38d2d67e#subdirectory=packages/python"]
+openengine = ["openengine-proto @ git+https://github.com/ai-dynamo/openengine.git@a66ff6f73a65e262a7c3edd5ea6fd0d8701d402f#subdirectory=packages/python"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "addict==2.4.0",

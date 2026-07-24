@@ -16,12 +16,10 @@ from openengine import MINIMUM_CLIENT_REVISION, SCHEMA_REVISION
 from openengine.v1 import (
     error_pb2,
     generation_pb2,
-    input_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
     model_pb2,
-    observability_pb2,
     openengine_pb2_grpc,
     server_pb2,
 )
@@ -378,7 +376,7 @@ class OpenEngineServicer(
             if (
                 self.role
                 in (server_pb2.ENGINE_ROLE_PREFILL, server_pb2.ENGINE_ROLE_DECODE)
-                and item.modality == input_pb2.MODALITY_AUDIO
+                and item.modality == generation_pb2.MODALITY_AUDIO
             ):
                 raise ValueError("SGLang audio prefill/decode is unsupported")
 
@@ -759,11 +757,11 @@ class OpenEngineServicer(
         modalities = []
         image_id = getattr(tokens, "image_token_id", None)
         if image_id is not None:
-            modalities.append(input_pb2.MODALITY_IMAGE)
+            modalities.append(generation_pb2.MODALITY_IMAGE)
         if getattr(tokens, "video_token_id", None) is not None:
-            modalities.append(input_pb2.MODALITY_VIDEO)
+            modalities.append(generation_pb2.MODALITY_VIDEO)
         if getattr(tokens, "audio_token_id", None) is not None:
-            modalities.append(input_pb2.MODALITY_AUDIO)
+            modalities.append(generation_pb2.MODALITY_AUDIO)
         return modalities, image_id
 
     async def GetModelInfo(self, request, context) -> model_pb2.ModelInfo:
@@ -778,7 +776,8 @@ class OpenEngineServicer(
             [
                 value
                 for value in modalities
-                if value in (input_pb2.MODALITY_IMAGE, input_pb2.MODALITY_VIDEO)
+                if value
+                in (generation_pb2.MODALITY_IMAGE, generation_pb2.MODALITY_VIDEO)
             ]
             if self.role
             in (server_pb2.ENGINE_ROLE_PREFILL, server_pb2.ENGINE_ROLE_DECODE)
@@ -788,9 +787,9 @@ class OpenEngineServicer(
             aggregate_modalities=aggregate,
             prefill_decode_modalities=pd_modalities,
             source_types=[
-                input_pb2.MEDIA_SOURCE_TYPE_URL,
-                input_pb2.MEDIA_SOURCE_TYPE_DATA_URI,
-                input_pb2.MEDIA_SOURCE_TYPE_RAW_BYTES,
+                generation_pb2.MEDIA_SOURCE_TYPE_URL,
+                generation_pb2.MEDIA_SOURCE_TYPE_DATA_URI,
+                generation_pb2.MEDIA_SOURCE_TYPE_RAW_BYTES,
             ],
             supports_per_request_media_options=True,
         )
@@ -847,7 +846,7 @@ class OpenEngineServicer(
             multimodal_capabilities=mm,
         )
 
-    async def GetLoad(self, request, context) -> observability_pb2.LoadInfo:
+    async def GetLoad(self, request, context) -> server_pb2.LoadInfo:
         snapshots = await self.tm.get_loads(dp_rank=None)
         values = [value.to_dict() for value in snapshots]
         page_size = max(1, int(self.args.page_size or 1))
@@ -859,7 +858,7 @@ class OpenEngineServicer(
             max((value.get("timestamp", 0) for value in values), default=0)
             or time.time()
         )
-        info = observability_pb2.LoadInfo(
+        info = server_pb2.LoadInfo(
             instance_id=self.instance_id,
             timestamp_unix_nanos=int(timestamp * 1_000_000_000),
             running_requests=max(scheduler_running, in_flight),
@@ -886,7 +885,7 @@ class OpenEngineServicer(
         if request.include_per_rank:
             for value in values:
                 info.ranks.append(
-                    observability_pb2.RankLoadInfo(
+                    server_pb2.RankLoadInfo(
                         data_parallel_rank=int(value.get("dp_rank", 0)),
                         running_requests=int(value.get("num_running_reqs", 0)),
                         queued_requests=int(value.get("num_waiting_reqs", 0)),
@@ -1078,9 +1077,6 @@ class OpenEngineServicer(
                 )
             )
         return connector
-
-    async def GetKvConnectorInfo(self, request, context) -> kv_pb2.KvConnectorInfo:
-        return self._connector_info()
 
     def _unsupported_kv_event_cache(self) -> str | None:
         """Return why canonical Dynamo KV routing events cannot be advertised."""

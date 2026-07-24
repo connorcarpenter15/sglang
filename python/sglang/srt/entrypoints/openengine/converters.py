@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from google.protobuf.json_format import MessageToDict
-from openengine.v1 import generation_pb2, input_pb2, server_pb2
+from openengine.v1 import generation_pb2, server_pb2
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -15,9 +15,9 @@ HANDOFF_PROFILE = "sglang.bootstrap.v1"
 MAX_BOOTSTRAP_ROOM = (1 << 63) - 1
 
 _MODALITIES = {
-    input_pb2.MODALITY_IMAGE: "image",
-    input_pb2.MODALITY_VIDEO: "video",
-    input_pb2.MODALITY_AUDIO: "audio",
+    generation_pb2.MODALITY_IMAGE: "image",
+    generation_pb2.MODALITY_VIDEO: "video",
+    generation_pb2.MODALITY_AUDIO: "audio",
 }
 
 _MEDIA_OPTION_FIELDS = {
