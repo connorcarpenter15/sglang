@@ -375,9 +375,7 @@ def test_media_conversion_accepts_native_regex_alias():
 
 def test_media_conversion_does_not_treat_native_pad_token_as_numbered():
     processor = _multimodal_processor()
-    processor.mm_tokens.image_token = (
-        "<|vision_start|><|image_pad|><|vision_end|>"
-    )
+    processor.mm_tokens.image_token = "<|vision_start|><|image_pad|><|vision_end|>"
     processor.mm_tokens.image_token_regex = re.compile(
         r"<\|vision_start\|><\|image_pad\|><\|vision_end\|>"
     )
