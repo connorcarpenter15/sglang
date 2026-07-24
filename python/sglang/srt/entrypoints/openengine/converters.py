@@ -10,6 +10,7 @@ from google.protobuf.json_format import MessageToDict
 from openengine.v1 import generation_pb2, server_pb2
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import Modality
 
 HANDOFF_PROFILE = "sglang.bootstrap.v1"
 MAX_BOOTSTRAP_ROOM = (1 << 63) - 1
@@ -222,6 +223,214 @@ def _media(request: generation_pb2.GenerateRequest) -> dict[str, Any]:
     return result
 
 
+_NUMBERED_MEDIA_PLACEHOLDER = re.compile(r"<\|(image|video|audio)_([^|]+)\|>")
+
+
+def _encode_placeholder(tokenizer: Any, text: str) -> list[int]:
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None:
+        return []
+    try:
+        return [int(value) for value in encode(text, add_special_tokens=False)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _placeholder(
+    multimodal_processor: Any, modality: str
+) -> tuple[str, tuple[int, ...]] | None:
+    marker_for = getattr(multimodal_processor, "get_unexpanded_mm_token", None)
+    if marker_for is None:
+        return None
+    text = marker_for(Modality.from_str(modality))
+    if not isinstance(text, str) or not text:
+        return None
+
+    tokenizer = getattr(multimodal_processor, "_tokenizer", None)
+    token_ids = _encode_placeholder(tokenizer, text)
+    if not token_ids:
+        return None
+    return text, tuple(token_ids)
+
+
+def _expected_numbered_placeholders(modalities: list[str]) -> list[str]:
+    indexes = {modality: 0 for modality in _MODALITIES.values()}
+    expected = []
+    for modality in modalities:
+        indexes[modality] += 1
+        expected.append(f"<|{modality}_{indexes[modality]}|>")
+    return expected
+
+
+def _native_text_occurrences(
+    text: str, multimodal_processor: Any
+) -> list[tuple[int, int, str]]:
+    tokens = getattr(multimodal_processor, "mm_tokens", None)
+    get_regex = getattr(tokens, "get_combined_regex", None)
+    get_modality = getattr(tokens, "get_modality_of_token", None)
+    if get_regex is None or get_modality is None:
+        raise ValueError("SGLang multimodal processor cannot validate native markers")
+
+    occurrences = []
+    for match in get_regex().finditer(text):
+        modality = get_modality(match.group(0))
+        if not isinstance(modality, Modality):
+            raise ValueError("SGLang native media placeholder has unknown modality")
+        occurrences.append((match.start(), match.end(), modality.name.lower()))
+    return occurrences
+
+
+def _replacement_placeholders(
+    multimodal_processor: Any, modalities: list[str]
+) -> dict[str, tuple[str, tuple[int, ...]]]:
+    placeholders = {
+        modality: _placeholder(multimodal_processor, modality)
+        for modality in set(modalities)
+    }
+    missing_specs = [
+        modality
+        for modality, placeholder in placeholders.items()
+        if placeholder is None
+    ]
+    if missing_specs:
+        raise ValueError(
+            "SGLang multimodal processor does not define replacement placeholders for "
+            f"{sorted(missing_specs)}"
+        )
+    return placeholders
+
+
+def _normalize_numbered_text(
+    text: str,
+    modalities: list[str],
+    multimodal_processor: Any,
+) -> str:
+    numbered = list(_NUMBERED_MEDIA_PLACEHOLDER.finditer(text))
+    native = _native_text_occurrences(text, multimodal_processor)
+    if numbered:
+        if native:
+            raise ValueError(
+                "Prompt mixes canonical numbered and SGLang native media placeholders"
+            )
+        expected = _expected_numbered_placeholders(modalities)
+        actual = [match.group(0) for match in numbered]
+        if actual != expected:
+            raise ValueError(
+                "Canonical numbered media placeholders must match request media "
+                f"in order: expected {expected}, got {actual}"
+            )
+        placeholders = _replacement_placeholders(multimodal_processor, modalities)
+        parts = []
+        offset = 0
+        for match, modality in zip(numbered, modalities):
+            parts.extend((text[offset : match.start()], placeholders[modality][0]))
+            offset = match.end()
+        parts.append(text[offset:])
+        return "".join(parts)
+
+    native_modalities = [modality for _, _, modality in native]
+    if native_modalities:
+        if native_modalities != modalities:
+            raise ValueError(
+                "SGLang native media placeholders must match request media in order"
+            )
+        return text
+    raise ValueError(
+        "Multimodal prompt requires exactly one placeholder per media item"
+    )
+
+
+def _decode_token_ids(tokenizer: Any, input_ids: list[int]) -> str | None:
+    decode = getattr(tokenizer, "decode", None)
+    if decode is None:
+        return None
+    try:
+        return str(decode(input_ids, skip_special_tokens=False))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_numbered_token_ids(
+    input_ids: list[int],
+    modalities: list[str],
+    multimodal_processor: Any,
+) -> list[int]:
+    tokenizer = getattr(multimodal_processor, "_tokenizer", None)
+    decoded = _decode_token_ids(tokenizer, input_ids)
+    if decoded is None:
+        raise ValueError("SGLang tokenizer could not decode multimodal token input")
+    numbered = list(_NUMBERED_MEDIA_PLACEHOLDER.finditer(decoded))
+    native = _native_text_occurrences(decoded, multimodal_processor)
+    if numbered:
+        if native:
+            raise ValueError(
+                "Prompt mixes canonical numbered and SGLang native media placeholders"
+            )
+        expected = _expected_numbered_placeholders(modalities)
+        actual = [match.group(0) for match in numbered]
+        if actual != expected:
+            raise ValueError(
+                "Canonical numbered media placeholders must match request media "
+                f"in order: expected {expected}, got {actual}"
+            )
+        placeholders = _replacement_placeholders(multimodal_processor, modalities)
+        output = []
+        offset = 0
+        for canonical, modality in zip(expected, modalities):
+            pattern = _encode_placeholder(tokenizer, canonical)
+            match_offset = next(
+                (
+                    index
+                    for index in range(offset, len(input_ids) - len(pattern) + 1)
+                    if input_ids[index : index + len(pattern)] == pattern
+                ),
+                None,
+            )
+            if not pattern or match_offset is None:
+                raise ValueError(
+                    f"Could not normalize tokenized media placeholder {canonical}"
+                )
+            output.extend(input_ids[offset:match_offset])
+            output.extend(placeholders[modality][1])
+            offset = match_offset + len(pattern)
+        output.extend(input_ids[offset:])
+        return output
+
+    native_modalities = [modality for _, _, modality in native]
+    if native_modalities:
+        if native_modalities != modalities:
+            raise ValueError(
+                "SGLang native media token placeholders must match request media in order"
+            )
+        return input_ids
+    raise ValueError(
+        "Multimodal token input requires exactly one placeholder per media item"
+    )
+
+
+def _normalize_media_placeholders(
+    request: generation_pb2.GenerateRequest,
+    kwargs: dict[str, Any],
+    multimodal_processor: Any,
+) -> None:
+    if not request.media:
+        return
+
+    modalities = [_MODALITIES[item.modality] for item in request.media]
+
+    if "text" in kwargs:
+        kwargs["text"] = _normalize_numbered_text(
+            kwargs["text"], modalities, multimodal_processor
+        )
+        return
+
+    kwargs["input_ids"] = _normalize_numbered_token_ids(
+        kwargs["input_ids"],
+        modalities,
+        multimodal_processor,
+    )
+
+
 def _bootstrap(request: generation_pb2.GenerateRequest, role: int) -> tuple[dict, str]:
     if role == server_pb2.ENGINE_ROLE_AGGREGATED:
         if request.kv.HasField("session"):
@@ -263,6 +472,7 @@ def convert_generate(
     model_aliases: set[str],
     metadata: dict[str, str],
     lora_path: str | None = None,
+    multimodal_processor: Any = None,
 ) -> ConvertedGenerate:
     if not request.request_id:
         raise ValueError("request_id must not be empty")
@@ -307,6 +517,10 @@ def convert_generate(
         kwargs["text"] = request.prompt
     else:
         kwargs["input_ids"] = list(request.token_ids.ids)
+    if request.media and multimodal_processor is None:
+        raise ValueError("SGLang model does not have a multimodal processor")
+    if request.media:
+        _normalize_media_placeholders(request, kwargs, multimodal_processor)
     if request.kv.HasField("cache_salt"):
         kwargs["extra_key"] = request.kv.cache_salt
     if lora_path:

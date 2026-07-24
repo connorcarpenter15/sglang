@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,11 @@ from sglang.srt.entrypoints.openengine.converters import (
 from sglang.srt.entrypoints.openengine.lora_registry import LoraRegistry
 from sglang.srt.entrypoints.openengine.server import resolve_advertised_host
 from sglang.srt.entrypoints.openengine.servicer import OpenEngineServicer
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-c-test-cpu")
@@ -151,8 +157,46 @@ async def test_handoff_evidence_preserves_uint64_room_as_decimal_string(caplog):
     await servicer.close()
 
 
+def _multimodal_processor():
+    class _Tokenizer:
+        def encode(self, text, *, add_special_tokens):
+            assert not add_special_tokens
+            token_ids = {
+                "<|endoftext11|>": [21, 22],
+                "<image>": [31, 32, 33],
+                "<video>": [34, 35],
+                "<|audio_1|>": [41, 42],
+                "<|image_1|>": [51, 52],
+            }
+            return token_ids[text]
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            assert not skip_special_tokens
+            if token_ids == [7, 41, 42, 8, 51, 52]:
+                return "Ask <|audio_1|> then <|image_1|>"
+            if token_ids == [7, 61, 62]:
+                return "Ask <audio_alias>"
+            return "Ask"
+
+    class _Processor:
+        get_unexpanded_mm_token = BaseMultimodalProcessor.get_unexpanded_mm_token
+
+    processor = _Processor()
+    processor._tokenizer = _Tokenizer()
+    processor.mm_tokens = MultimodalSpecialTokens(
+        audio_token="<|endoftext11|>",
+        audio_token_id=22,
+        image_token="<image>",
+        image_token_id=32,
+        video_token="<video>",
+        video_token_id=35,
+    ).build(SimpleNamespace(tokenizer=processor._tokenizer))
+    return processor
+
+
 def test_media_order_and_raw_bytes_survive_conversion():
     request = _request()
+    request.prompt = "<image><video><image>Hello"
     request.media.extend(
         [
             generation_pb2.MediaItem(
@@ -182,6 +226,7 @@ def test_media_order_and_raw_bytes_survive_conversion():
         served_model_name="served",
         model_aliases={"served"},
         metadata={},
+        multimodal_processor=_multimodal_processor(),
     ).request
     assert converted.modalities == ["image", "video", "image"]
     assert converted.image_data == [
@@ -190,6 +235,229 @@ def test_media_order_and_raw_bytes_survive_conversion():
     ]
     assert converted.video_data == ["data:video/mp4;base64,dmlkZW8="]
     assert converted.image_max_dynamic_patch == 4
+
+
+@pytest.mark.parametrize(
+    ("input_kind", "original", "expected"),
+    [
+        (
+            "prompt",
+            "Ask <|audio_1|> then <|image_1|>",
+            "Ask <|endoftext11|> then <image>",
+        ),
+        (
+            "prompt",
+            "<|endoftext11|> then <image> Ask",
+            "<|endoftext11|> then <image> Ask",
+        ),
+        (
+            "token_ids",
+            [7, 41, 42, 8, 51, 52],
+            [7, 21, 22, 8, 31, 32, 33],
+        ),
+    ],
+)
+def test_media_conversion_normalizes_processor_placeholders(
+    input_kind, original, expected
+):
+    request = _request()
+    if input_kind == "prompt":
+        request.prompt = original
+    else:
+        request.ClearField("prompt")
+        request.token_ids.ids.extend(original)
+    request.media.extend(
+        [
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                data_uri="data:audio/wav;base64,AA==",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                data_uri="data:image/png;base64,AA==",
+            ),
+        ]
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=_multimodal_processor(),
+    ).request
+
+    assert getattr(converted, "text" if input_kind == "prompt" else "input_ids") == (
+        expected
+    )
+
+
+def test_qwen_video_marker_includes_vision_boundaries():
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    token_text = {
+        1: "<|vision_start|>",
+        2: "<|video_pad|>",
+        3: "<|vision_end|>",
+    }
+    processor = object.__new__(QwenVLImageProcessor)
+    processor._tokenizer = SimpleNamespace(
+        convert_ids_to_tokens=lambda token_ids: [
+            token_text[token_id] for token_id in token_ids
+        ]
+    )
+    processor.vision_start_token_id = 1
+    processor.vision_end_token_id = 3
+    processor.mm_tokens = SimpleNamespace(video_token_id=2)
+
+    assert processor.get_unexpanded_mm_token(Modality.VIDEO) == (
+        "<|vision_start|><|video_pad|><|vision_end|>"
+    )
+
+
+def test_canonical_qwen_audio_without_complete_marker_fails_closed():
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    processor = object.__new__(QwenVLImageProcessor)
+    processor._tokenizer = SimpleNamespace()
+    processor.audio_start_token_id = 4
+    processor.audio_end_token_id = None
+    processor.mm_tokens = MultimodalSpecialTokens(
+        audio_token="<|audio_pad|>",
+        audio_token_id=5,
+    ).build(SimpleNamespace(tokenizer=processor._tokenizer))
+    request = _request()
+    request.prompt = "Ask <|audio_1|>"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_AUDIO,
+            data_uri="data:audio/wav;base64,AA==",
+        )
+    )
+
+    with pytest.raises(ValueError, match="replacement placeholders"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_AGGREGATED,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+            multimodal_processor=processor,
+        )
+
+
+def test_media_conversion_accepts_native_regex_alias():
+    processor = _multimodal_processor()
+    processor.mm_tokens.image_token_regex = re.compile(r"<image(?:_alias)?>")
+    processor.mm_tokens.combined_regex = None
+    processor.get_unexpanded_mm_token = lambda modality: None
+    request = _request()
+    request.prompt = "Ask <image_alias>"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_IMAGE,
+            data_uri="data:image/png;base64,AA==",
+        )
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=processor,
+    ).request
+
+    assert converted.text == "Ask <image_alias>"
+
+
+def test_media_token_ids_accept_native_regex_alias_without_replacement_hook():
+    processor = _multimodal_processor()
+    processor.mm_tokens.audio_token_regex = re.compile(r"<audio(?:_alias)?>")
+    processor.mm_tokens.combined_regex = None
+    processor.get_unexpanded_mm_token = lambda modality: None
+    request = _request()
+    request.ClearField("prompt")
+    request.token_ids.ids.extend([7, 61, 62])
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_AUDIO,
+            data_uri="data:audio/wav;base64,AA==",
+        )
+    )
+
+    converted = convert_generate(
+        request,
+        role=server_pb2.ENGINE_ROLE_AGGREGATED,
+        served_model_name="served",
+        model_aliases={"served"},
+        metadata={},
+        multimodal_processor=processor,
+    ).request
+
+    assert converted.input_ids == [7, 61, 62]
+
+
+@pytest.mark.parametrize(
+    ("input_kind", "original"),
+    [
+        ("prompt", "<|audio_2|><|image_1|>Ask"),
+        ("token_ids", [7, 8]),
+    ],
+)
+def test_media_conversion_rejects_missing_or_mismatched_placeholders(
+    input_kind, original
+):
+    request = _request()
+    if input_kind == "prompt":
+        request.prompt = original
+    else:
+        request.ClearField("prompt")
+        request.token_ids.ids.extend(original)
+    request.media.extend(
+        [
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                data_uri="data:audio/wav;base64,AA==",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                data_uri="data:image/png;base64,AA==",
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="placeholder"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_AGGREGATED,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+            multimodal_processor=_multimodal_processor(),
+        )
+
+
+def test_media_conversion_rejects_model_without_multimodal_processor():
+    request = _request()
+    request.prompt = "<|audio_1|>Ask"
+    request.media.append(
+        generation_pb2.MediaItem(
+            modality=generation_pb2.MODALITY_AUDIO,
+            data_uri="data:audio/wav;base64,AA==",
+        )
+    )
+
+    with pytest.raises(ValueError, match="does not have a multimodal processor"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_AGGREGATED,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+        )
 
 
 @pytest.mark.asyncio

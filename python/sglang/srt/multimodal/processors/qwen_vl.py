@@ -304,6 +304,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
+        self.audio_end_token_id = getattr(hf_config, "audio_end_token_id", None)
 
         self._spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
         self._tokens_per_second = getattr(
@@ -320,6 +321,45 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    def get_unexpanded_mm_token(self, modality: Modality) -> Optional[str]:
+        if modality == Modality.IMAGE:
+            pad_token_id = self.mm_tokens.image_token_id
+            boundary_token_ids = (
+                self.vision_start_token_id,
+                pad_token_id,
+                self.vision_end_token_id,
+            )
+        elif modality == Modality.VIDEO:
+            pad_token_id = self.mm_tokens.video_token_id
+            boundary_token_ids = (
+                self.vision_start_token_id,
+                pad_token_id,
+                self.vision_end_token_id,
+            )
+        elif modality == Modality.AUDIO:
+            pad_token_id = self.mm_tokens.audio_token_id
+            boundary_token_ids = (
+                self.audio_start_token_id,
+                pad_token_id,
+                self.audio_end_token_id,
+            )
+        else:
+            return None
+
+        if any(token_id is None for token_id in boundary_token_ids):
+            return None
+        try:
+            tokens = self._tokenizer.convert_ids_to_tokens(list(boundary_token_ids))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            not isinstance(tokens, list)
+            or len(tokens) != len(boundary_token_ids)
+            or not all(isinstance(token, str) and token for token in tokens)
+        ):
+            return None
+        return "".join(tokens)
 
     @property
     def spatial_merge_size(self):

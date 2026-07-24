@@ -454,6 +454,7 @@ class OpenEngineServicer(
                 model_aliases=self.model_aliases,
                 metadata=metadata,
                 lora_path=("logical" if request.lora_name else None),
+                multimodal_processor=self.tm.mm_processor,
             )
             session_id = converted.session_id
             await self.admission.admit(request.request_id, session_id)
