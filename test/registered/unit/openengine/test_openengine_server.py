@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from openengine._schema_identity import SCHEMA_RELEASE
 from openengine.v1 import (
     generation_pb2,
     kv_pb2,
@@ -15,13 +16,12 @@ from openengine.v1 import (
     server_pb2,
 )
 
-from sglang.srt.entrypoints.openengine._schema_pin import OPENENGINE_COMMIT
 from sglang.srt.entrypoints.openengine.admission import (
     DrainingError,
     ProcessAdmission,
 )
 from sglang.srt.entrypoints.openengine.converters import (
-    HANDOFF_PROFILE,
+    CLIENT_BOOTSTRAP_ATTRIBUTES_KEY,
     MAX_BOOTSTRAP_ROOM,
     convert_generate,
 )
@@ -59,18 +59,29 @@ def _request(request_id="request-1"):
     return request
 
 
-def test_typed_bootstrap_is_required_and_room_is_signed_i64_safe():
-    request = _request()
-    request.kv.session.CopyFrom(
-        kv_pb2.KvSessionRef(
-            session_id="session-1",
-            handoff_profile=HANDOFF_PROFILE,
-            bootstrap=kv_pb2.KvBootstrap(
-                endpoint=kv_pb2.KvEndpoint(host="decode", port=8998, protocol="tcp"),
-                room_id=MAX_BOOTSTRAP_ROOM,
-            ),
-        )
+def _bootstrap_session(
+    *,
+    room_id: int = 1,
+    host: str = "decode",
+    port: int = 8998,
+    session_id: str = "session-1",
+) -> kv_pb2.KvSessionRef:
+    session = kv_pb2.KvSessionRef(session_id=session_id)
+    session.attributes_struct.update(
+        {
+            CLIENT_BOOTSTRAP_ATTRIBUTES_KEY: {
+                "endpoint": {"host": host, "port": port, "protocol": "tcp"},
+                "handoff_id": None,
+                "room_id": str(room_id),
+            }
+        }
     )
+    return session
+
+
+def test_bootstrap_attributes_are_required_and_room_is_signed_i64_safe():
+    request = _request()
+    request.kv.session.CopyFrom(_bootstrap_session(room_id=MAX_BOOTSTRAP_ROOM))
     converted = convert_generate(
         request,
         role=server_pb2.ENGINE_ROLE_PREFILL,
@@ -83,8 +94,26 @@ def test_typed_bootstrap_is_required_and_room_is_signed_i64_safe():
     assert converted.request.bootstrap_room == MAX_BOOTSTRAP_ROOM
     assert converted.request.sampling_params["max_new_tokens"] == 1
 
-    request.kv.session.bootstrap.room_id = MAX_BOOTSTRAP_ROOM + 1
+    request.kv.session.CopyFrom(_bootstrap_session(room_id=MAX_BOOTSTRAP_ROOM + 1))
     with pytest.raises(ValueError, match="room_id"):
+        convert_generate(
+            request,
+            role=server_pb2.ENGINE_ROLE_DECODE,
+            served_model_name="served",
+            model_aliases={"served"},
+            metadata={},
+        )
+
+    request.kv.session.attributes_struct.update(
+        {
+            CLIENT_BOOTSTRAP_ATTRIBUTES_KEY: {
+                "endpoint": {"host": "decode", "port": 8998, "protocol": "tcp"},
+                "handoff_id": None,
+                "room_id": 1,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="decimal string"):
         convert_generate(
             request,
             role=server_pb2.ENGINE_ROLE_DECODE,
@@ -97,16 +126,7 @@ def test_typed_bootstrap_is_required_and_room_is_signed_i64_safe():
 def test_disaggregation_rejects_parallel_outputs_before_scheduling():
     request = _request()
     request.sampling.num_sequences = 2
-    request.kv.session.CopyFrom(
-        kv_pb2.KvSessionRef(
-            session_id="session-1",
-            handoff_profile=HANDOFF_PROFILE,
-            bootstrap=kv_pb2.KvBootstrap(
-                endpoint=kv_pb2.KvEndpoint(host="prefill", port=8998, protocol="tcp"),
-                room_id=1,
-            ),
-        )
-    )
+    request.kv.session.CopyFrom(_bootstrap_session(host="prefill"))
     with pytest.raises(ValueError, match="one output sequence"):
         convert_generate(
             request,
@@ -128,14 +148,7 @@ async def test_handoff_evidence_preserves_uint64_room_as_decimal_string(caplog):
     )
     request = _request()
     request.kv.session.CopyFrom(
-        kv_pb2.KvSessionRef(
-            session_id="session-1",
-            handoff_profile=HANDOFF_PROFILE,
-            bootstrap=kv_pb2.KvBootstrap(
-                endpoint=kv_pb2.KvEndpoint(host="prefill", port=8998, protocol="tcp"),
-                room_id=MAX_BOOTSTRAP_ROOM,
-            ),
-        )
+        _bootstrap_session(host="prefill", room_id=MAX_BOOTSTRAP_ROOM)
     )
     with caplog.at_level(logging.INFO):
         responses = [
@@ -148,11 +161,11 @@ async def test_handoff_evidence_preserves_uint64_room_as_decimal_string(caplog):
     ]
     assert [value["phase"] for value in evidence] == ["admitted", "complete"]
     assert all(value["session_id"] == "session-1" for value in evidence)
-    assert all(value["handoff_profile"] == HANDOFF_PROFILE for value in evidence)
     assert all(
         value["bootstrap"]["room_id"] == str(MAX_BOOTSTRAP_ROOM) for value in evidence
     )
     assert [response.WhichOneof("event") for response in responses] == ["prefill_ready"]
+    assert responses[0].prefill_ready.kv_session == request.kv.session
     assert runtime.aborts == []
     await servicer.close()
 
@@ -214,12 +227,6 @@ def test_media_order_and_raw_bytes_survive_conversion():
             ),
         ]
     )
-    request.media_options.update(
-        {
-            "image": {"image_max_dynamic_patch": 4},
-            "video": {"use_audio_in_video": False},
-        }
-    )
     converted = convert_generate(
         request,
         role=server_pb2.ENGINE_ROLE_AGGREGATED,
@@ -234,7 +241,6 @@ def test_media_order_and_raw_bytes_survive_conversion():
         "https://example.test/image.png",
     ]
     assert converted.video_data == ["data:video/mp4;base64,dmlkZW8="]
-    assert converted.image_max_dynamic_patch == 4
 
 
 @pytest.mark.parametrize(
@@ -728,17 +734,16 @@ async def test_servicer_streams_terminal_usage_and_discovers_per_rank_sources():
     assert runtime.aborts == []
 
     server_info = await servicer.GetServerInfo(None, _Context())
-    assert server_info.schema_revision == 3
-    assert server_info.schema_release == OPENENGINE_COMMIT
+    assert server_info.schema_revision == 1
+    assert server_info.schema_release == SCHEMA_RELEASE
     assert list(server_info.supported_models) == ["served"]
     assert server_info.kv_connector.enabled is False
-    assert server_info.kv_connector.handoff_profile == ""
     model_info = await servicer.GetModelInfo(
         model_pb2.GetModelInfoRequest(model="served"), _Context()
     )
     assert model_info.model_id == "canonical"
     assert list(model_info.served_model_aliases) == ["canonical"]
-    assert model_info.tokenizer.source == "canonical"
+    assert list(model_info.tokenizer_modes) == ["auto"]
     sources = await servicer.GetKvEventSources(
         kv_pb2.GetKvEventSourcesRequest(), _Context()
     )
@@ -834,7 +839,7 @@ async def test_dropped_parallel_stream_aborts_every_engine_request():
 
 
 @pytest.mark.asyncio
-async def test_drain_waits_for_all_parallel_abort_terminals():
+async def test_dropped_parallel_stream_waits_for_all_abort_terminals():
     runtime = _Runtime()
     runtime.tokenizer_manager = _AbortAcknowledgingTokenizerManager()
     admission = ProcessAdmission()
@@ -850,24 +855,12 @@ async def test_drain_waits_for_all_parallel_abort_terminals():
     await anext(stream)
     await stream.aclose()
 
-    async def collect_drain():
-        return [
-            response
-            async for response in servicer.Drain(
-                lifecycle_pb2.DrainRequest(stop_accepting_new_requests=True),
-                _Context(),
-            )
-        ]
-
-    drain_task = asyncio.create_task(collect_drain())
     await asyncio.sleep(0.01)
     assert await admission.snapshot() == (1, 0)
-    assert not drain_task.done()
     assert len(runtime.aborts) == 2
 
     runtime.tokenizer_manager.abort_terminal.set()
-    updates = await asyncio.wait_for(drain_task, timeout=1)
-    assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
+    assert await admission.wait_empty(timeout=1)
     assert await admission.snapshot() == (0, 0)
     await servicer.close()
 
@@ -892,22 +885,8 @@ async def test_abort_signal_failure_retains_admission_until_engine_terminal():
     load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
     assert load.running_requests == 1
 
-    async def collect_drain():
-        return [
-            response
-            async for response in servicer.Drain(
-                lifecycle_pb2.DrainRequest(stop_accepting_new_requests=True),
-                _Context(),
-            )
-        ]
-
-    drain_task = asyncio.create_task(collect_drain())
-    await asyncio.sleep(0.01)
-    assert not drain_task.done()
-
     runtime.tokenizer_manager.abort_terminal.set()
-    updates = await asyncio.wait_for(drain_task, timeout=1)
-    assert updates[-1].state == lifecycle_pb2.DRAIN_STATE_COMPLETE
+    assert await admission.wait_empty(timeout=1)
     assert await admission.snapshot() == (0, 0)
     load = await servicer.GetLoad(server_pb2.GetLoadRequest(), _Context())
     assert load.running_requests == 0

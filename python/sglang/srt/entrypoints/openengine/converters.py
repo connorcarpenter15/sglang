@@ -12,24 +12,13 @@ from openengine.v1 import generation_pb2, server_pb2
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Modality
 
-HANDOFF_PROFILE = "sglang.bootstrap.v1"
+CLIENT_BOOTSTRAP_ATTRIBUTES_KEY = "openengine.client_bootstrap.v1"
 MAX_BOOTSTRAP_ROOM = (1 << 63) - 1
 
 _MODALITIES = {
     generation_pb2.MODALITY_IMAGE: "image",
     generation_pb2.MODALITY_VIDEO: "video",
     generation_pb2.MODALITY_AUDIO: "audio",
-}
-
-_MEDIA_OPTION_FIELDS = {
-    "image": {
-        "max_dynamic_patch",
-        "min_dynamic_patch",
-        "image_max_dynamic_patch",
-        "images_config",
-    },
-    "video": {"video_max_dynamic_patch", "use_audio_in_video"},
-    "audio": set(),
 }
 
 
@@ -198,28 +187,6 @@ def _media(request: generation_pb2.GenerateRequest) -> dict[str, Any]:
     ):
         result["mm_hashes"] = image_hashes
 
-    options = (
-        MessageToDict(request.media_options, preserving_proto_field_name=True)
-        if request.media_options.fields
-        else {}
-    )
-    unknown_modalities = set(options).difference(_MEDIA_OPTION_FIELDS)
-    if unknown_modalities:
-        raise ValueError(
-            f"Unknown media option modalities: {sorted(unknown_modalities)}"
-        )
-    for modality, values in options.items():
-        if not isinstance(values, dict):
-            raise ValueError(f"media_options.{modality} must be an object")
-        unknown = set(values).difference(_MEDIA_OPTION_FIELDS[modality])
-        if unknown:
-            raise ValueError(
-                f"Unsupported SGLang media options for {modality}: {sorted(unknown)}"
-            )
-        for name, value in values.items():
-            if name in result and result[name] != value:
-                raise ValueError(f"Conflicting media option {name!r}")
-            result[name] = value
     return result
 
 
@@ -431,6 +398,42 @@ def _normalize_media_placeholders(
     )
 
 
+def parse_bootstrap_attributes(session) -> tuple[str, int, int, str]:
+    attributes = MessageToDict(
+        session.attributes_struct, preserving_proto_field_name=True
+    )
+    bootstrap = attributes.get(CLIENT_BOOTSTRAP_ATTRIBUTES_KEY)
+    if not isinstance(bootstrap, dict):
+        raise ValueError(
+            f"SGLang disaggregation requires "
+            f"kv.session.attributes_struct[{CLIENT_BOOTSTRAP_ATTRIBUTES_KEY!r}]"
+        )
+    endpoint = bootstrap.get("endpoint")
+    if not isinstance(endpoint, dict):
+        raise ValueError("SGLang bootstrap requires an endpoint object")
+    host = endpoint.get("host")
+    if not isinstance(host, str) or not host:
+        raise ValueError("SGLang bootstrap requires a nonempty endpoint host")
+    port = endpoint.get("port")
+    if (
+        isinstance(port, bool)
+        or not isinstance(port, (int, float))
+        or not float(port).is_integer()
+        or not 1 <= int(port) <= 65535
+    ):
+        raise ValueError("SGLang bootstrap endpoint port must be in [1, 65535]")
+    protocol = endpoint.get("protocol", "tcp")
+    if not isinstance(protocol, str) or protocol != "tcp":
+        raise ValueError("SGLang bootstrap endpoint protocol must be 'tcp'")
+    room = bootstrap.get("room_id")
+    if not isinstance(room, str) or not room.isdecimal():
+        raise ValueError("SGLang bootstrap room_id must be a decimal string")
+    room_id = int(room, 10)
+    if room_id > MAX_BOOTSTRAP_ROOM:
+        raise ValueError(f"SGLang bootstrap room_id must be <= {MAX_BOOTSTRAP_ROOM}")
+    return host, int(port), room_id, protocol
+
+
 def _bootstrap(request: generation_pb2.GenerateRequest, role: int) -> tuple[dict, str]:
     if role == server_pb2.ENGINE_ROLE_AGGREGATED:
         if request.kv.HasField("session"):
@@ -441,22 +444,11 @@ def _bootstrap(request: generation_pb2.GenerateRequest, role: int) -> tuple[dict
     if not request.kv.HasField("session"):
         raise ValueError("Disaggregated SGLang requests require kv.session")
     session = request.kv.session
-    if session.handoff_profile != HANDOFF_PROFILE:
-        raise ValueError(
-            f"SGLang requires handoff_profile {HANDOFF_PROFILE!r}, got "
-            f"{session.handoff_profile!r}"
-        )
-    if not session.HasField("bootstrap"):
-        raise ValueError("SGLang disaggregation requires kv.session.bootstrap")
-    bootstrap = session.bootstrap
-    if not bootstrap.endpoint.host or bootstrap.endpoint.port == 0:
-        raise ValueError("SGLang bootstrap requires a host and nonzero port")
-    if bootstrap.room_id > MAX_BOOTSTRAP_ROOM:
-        raise ValueError(f"SGLang bootstrap room_id must be <= {MAX_BOOTSTRAP_ROOM}")
+    host, port, room_id, _ = parse_bootstrap_attributes(session)
     values: dict[str, Any] = {
-        "bootstrap_host": bootstrap.endpoint.host,
-        "bootstrap_port": bootstrap.endpoint.port,
-        "bootstrap_room": bootstrap.room_id,
+        "bootstrap_host": host,
+        "bootstrap_port": port,
+        "bootstrap_room": room_id,
         "session_id": session.session_id or request.request_id,
     }
     if session.dp_rank:
@@ -547,7 +539,8 @@ def convert_generate(
 
 __all__ = [
     "ConvertedGenerate",
-    "HANDOFF_PROFILE",
+    "CLIENT_BOOTSTRAP_ATTRIBUTES_KEY",
     "MAX_BOOTSTRAP_ROOM",
     "convert_generate",
+    "parse_bootstrap_attributes",
 ]

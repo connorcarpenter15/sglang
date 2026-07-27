@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import grpc
-from openengine import MINIMUM_CLIENT_REVISION, SCHEMA_REVISION
+from openengine._schema_identity import SCHEMA_RELEASE
 from openengine.v1 import (
     error_pb2,
     generation_pb2,
@@ -26,9 +26,12 @@ from openengine.v1 import (
 
 from sglang.version import __version__ as sglang_version
 
-from ._schema_pin import OPENENGINE_COMMIT
+from ._schema_pin import (
+    MINIMUM_CLIENT_REVISION,
+    SCHEMA_REVISION,
+)
 from .admission import DrainingError, ProcessAdmission
-from .converters import HANDOFF_PROFILE, convert_generate
+from .converters import convert_generate, parse_bootstrap_attributes
 from .lora_registry import LoraRegistry
 
 logger = logging.getLogger(__name__)
@@ -366,8 +369,7 @@ class OpenEngineServicer(
             self.runtime.abort(rid=engine_request_id)
 
     def _validate_media_request(self, request: generation_pb2.GenerateRequest) -> None:
-        supported, _ = self._modalities()
-        supported_set = set(supported)
+        supported_set = set(self._modalities())
         for item in request.media:
             if item.modality not in supported_set:
                 raise ValueError(
@@ -391,19 +393,17 @@ class OpenEngineServicer(
         session = request.kv.session
         if not session.session_id:
             return
-        endpoint = session.bootstrap.endpoint
+        host, port, room_id, protocol = parse_bootstrap_attributes(session)
         record = {
             "phase": phase,
             "role": server_pb2.EngineRole.Name(self.role),
             "request_id": request.request_id,
             "session_id": session.session_id,
-            "handoff_profile": session.handoff_profile,
             "bootstrap": {
-                "host": endpoint.host,
-                "port": endpoint.port,
-                "protocol": endpoint.protocol,
-                # Preserve uint64 precision in JSON logs.
-                "room_id": str(session.bootstrap.room_id),
+                "host": host,
+                "port": port,
+                "protocol": protocol,
+                "room_id": str(room_id),
             },
         }
         if usage is not None:
@@ -740,7 +740,7 @@ class OpenEngineServicer(
             kv_connector=connector,
             schema_revision=SCHEMA_REVISION,
             minimum_client_revision=MINIMUM_CLIENT_REVISION,
-            schema_release=OPENENGINE_COMMIT,
+            schema_release=SCHEMA_RELEASE,
             capacity=capacity,
         )
         info.extra.update(
@@ -752,18 +752,17 @@ class OpenEngineServicer(
         )
         return info
 
-    def _modalities(self) -> tuple[list[int], int | None]:
+    def _modalities(self) -> list[int]:
         processor = getattr(self.tm, "mm_processor", None)
         tokens = getattr(processor, "mm_tokens", None)
         modalities = []
-        image_id = getattr(tokens, "image_token_id", None)
-        if image_id is not None:
+        if getattr(tokens, "image_token_id", None) is not None:
             modalities.append(generation_pb2.MODALITY_IMAGE)
         if getattr(tokens, "video_token_id", None) is not None:
             modalities.append(generation_pb2.MODALITY_VIDEO)
         if getattr(tokens, "audio_token_id", None) is not None:
             modalities.append(generation_pb2.MODALITY_AUDIO)
-        return modalities, image_id
+        return modalities
 
     async def GetModelInfo(self, request, context) -> model_pb2.ModelInfo:
         if request.model and request.model not in self.model_aliases:
@@ -771,31 +770,7 @@ class OpenEngineServicer(
                 grpc.StatusCode.NOT_FOUND,
                 f"Model {request.model!r} is not served by this SGLang runtime",
             )
-        modalities, image_id = self._modalities()
-        aggregate = modalities if self.role == server_pb2.ENGINE_ROLE_AGGREGATED else []
-        pd_modalities = (
-            [
-                value
-                for value in modalities
-                if value
-                in (generation_pb2.MODALITY_IMAGE, generation_pb2.MODALITY_VIDEO)
-            ]
-            if self.role
-            in (server_pb2.ENGINE_ROLE_PREFILL, server_pb2.ENGINE_ROLE_DECODE)
-            else []
-        )
-        mm = model_pb2.MultimodalCapabilities(
-            aggregate_modalities=aggregate,
-            prefill_decode_modalities=pd_modalities,
-            source_types=[
-                generation_pb2.MEDIA_SOURCE_TYPE_URL,
-                generation_pb2.MEDIA_SOURCE_TYPE_DATA_URI,
-                generation_pb2.MEDIA_SOURCE_TYPE_RAW_BYTES,
-            ],
-            supports_per_request_media_options=True,
-        )
-        if image_id is not None and 0 <= int(image_id) <= (1 << 32) - 1:
-            mm.routing_image_token_id = int(image_id)
+        modalities = self._modalities()
 
         logprobs = model_pb2.LogprobCapabilities(
             supported=True,
@@ -833,10 +808,6 @@ class OpenEngineServicer(
             max_context_length=self.tm.model_config.context_len,
             max_output_tokens=self.tm.model_config.context_len,
             tokenizer_modes=[self.args.tokenizer_mode],
-            tokenizer=model_pb2.TokenizerInfo(
-                source=self.args.tokenizer_path,
-                mode=self.args.tokenizer_mode,
-            ),
             supports_text_input=not self.args.skip_tokenizer_init,
             supports_token_ids_input=True,
             generation=generation,
@@ -844,7 +815,6 @@ class OpenEngineServicer(
             supports_multimodal=bool(modalities),
             reasoning_parser=self.args.reasoning_parser or "",
             tool_call_parser=self.args.tool_call_parser or "",
-            multimodal_capabilities=mm,
         )
 
     async def GetLoad(self, request, context) -> server_pb2.LoadInfo:
@@ -902,7 +872,7 @@ class OpenEngineServicer(
     async def Health(self, request, context) -> lifecycle_pb2.HealthResponse:
         healthy = bool(self.runtime.health_check())
         if self.admission.draining:
-            state = lifecycle_pb2.HEALTH_STATE_DRAINING
+            state = lifecycle_pb2.HEALTH_STATE_NOT_READY
         else:
             state = (
                 lifecycle_pb2.HEALTH_STATE_READY
@@ -964,62 +934,6 @@ class OpenEngineServicer(
             status=lifecycle_pb2.ABORT_STATUS_ABORTED, message="Abort requested"
         )
 
-    async def Drain(
-        self, request, context
-    ) -> AsyncGenerator[lifecycle_pb2.DrainResponse, None]:
-        if request.stop_accepting_new_requests:
-            await self.admission.start_drain()
-        in_flight, sessions = await self.admission.snapshot()
-        yield lifecycle_pb2.DrainResponse(
-            state=lifecycle_pb2.DRAIN_STATE_STARTED,
-            in_flight_requests=in_flight,
-            open_kv_sessions=sessions,
-        )
-        deadline = (
-            time.monotonic() + request.deadline_ms / 1000
-            if request.HasField("deadline_ms")
-            else None
-        )
-        while True:
-            in_flight, sessions = await self.admission.snapshot()
-            if in_flight == 0:
-                yield lifecycle_pb2.DrainResponse(
-                    state=lifecycle_pb2.DRAIN_STATE_COMPLETE,
-                    in_flight_requests=0,
-                    open_kv_sessions=sessions,
-                )
-                return
-            if deadline is not None and time.monotonic() >= deadline:
-                if request.abort_after_deadline:
-                    self.runtime.abort(abort_all=True)
-                    if await self.admission.wait_empty(timeout=5.0):
-                        _, sessions = await self.admission.snapshot()
-                        yield lifecycle_pb2.DrainResponse(
-                            state=lifecycle_pb2.DRAIN_STATE_COMPLETE,
-                            in_flight_requests=0,
-                            open_kv_sessions=sessions,
-                            message="Deadline reached; active requests were aborted",
-                        )
-                        return
-                yield lifecycle_pb2.DrainResponse(
-                    error=error_pb2.EngineError(
-                        code=error_pb2.ERROR_CODE_INTERNAL,
-                        message="Drain deadline expired with active requests",
-                    ),
-                    in_flight_requests=in_flight,
-                    open_kv_sessions=sessions,
-                )
-                return
-            yield lifecycle_pb2.DrainResponse(
-                state=lifecycle_pb2.DRAIN_STATE_IN_PROGRESS,
-                in_flight_requests=in_flight,
-                open_kv_sessions=sessions,
-            )
-            wait = 0.25
-            if deadline is not None:
-                wait = min(wait, max(0.0, deadline - time.monotonic()))
-            await self.admission.wait_empty(timeout=wait)
-
     def _require_lora(self) -> None:
         if not self.args.enable_lora:
             raise ValueError("SGLang was not launched with --enable-lora")
@@ -1064,10 +978,7 @@ class OpenEngineServicer(
             supports_remote_prefill=enabled,
             supports_decode_pull=enabled,
             supports_abort_cleanup=enabled,
-            supports_drain=enabled,
             schema_version=1,
-            handoff_profile=HANDOFF_PROFILE if enabled else "",
-            supports_client_bootstrap=enabled,
         )
         if self.role == server_pb2.ENGINE_ROLE_PREFILL:
             connector.local_endpoints.append(
