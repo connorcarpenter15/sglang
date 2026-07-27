@@ -1925,6 +1925,7 @@ class MMReceiverBase(ABC):
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
             lora_id=recv_req.lora_id,
+            lora_name=getattr(recv_req, "lora_name", None),
             input_embeds=recv_req.input_embeds,
             custom_logit_processor=recv_req.custom_logit_processor,
             require_reasoning=recv_req.require_reasoning,
@@ -1945,6 +1946,8 @@ class MMReceiverBase(ABC):
                 if self.scheduler.metrics_reporter.enable_metrics
                 else None
             ),
+            extra_key=getattr(recv_req, "extra_key", None),
+            cache_salt=getattr(recv_req, "extra_key", None),
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )

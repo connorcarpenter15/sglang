@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+python/openengine/v1/*_pb2.py
+python/openengine/v1/*_pb2_grpc.py
+python/openengine/v1/*_pb2.pyi
+python/openengine/_schema_identity.py
 
 # C extensions
 *.so

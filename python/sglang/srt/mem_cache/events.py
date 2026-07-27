@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.utils import (
     hash_str_to_int64,
 )
 
+_DYNAMO_CACHE_SALT_PREFIX = "dynamo-cache-salt:"
+
 
 class KVCacheEventMixin:
     def _record_store_event(self, node: Any, medium=None):
@@ -68,6 +70,12 @@ class KVCacheEventMixin:
                     page_tokens = list(raw[start:end])
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
+                cache_salt = node.key.cache_salt
+                extra_keys = (
+                    [[f"{_DYNAMO_CACHE_SALT_PREFIX}{cache_salt}"]]
+                    if cache_salt
+                    else None
+                )
 
                 self.kv_event_queue.append(
                     BlockStored(
@@ -77,6 +85,8 @@ class KVCacheEventMixin:
                         block_size=len(page_tokens),
                         lora_id=None,
                         medium=medium,
+                        lora_name=node.key.lora_name,
+                        extra_keys=extra_keys,
                     )
                 )
 

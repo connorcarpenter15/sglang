@@ -824,6 +824,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    # Stable external adapter name used for cache-routing event attribution.
+    lora_name: Optional[str] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py

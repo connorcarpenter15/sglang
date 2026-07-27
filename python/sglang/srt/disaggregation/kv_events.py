@@ -112,6 +112,13 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    # Canonical adapter name used by external KV routers. ``lora_id`` is kept
+    # in its historical positional slot for wire compatibility, but SGLang's
+    # runtime IDs are process-local strings and are not suitable routing keys.
+    lora_name: Optional[str] = None
+    # One optional list per block. Cache salts use Dynamo's tagged string form
+    # so they cannot be confused with LoRA names or multimodal hashes.
+    extra_keys: Optional[list[Optional[list[str]]]] = None
 
 
 class BlockRemoved(KVCacheEvent):

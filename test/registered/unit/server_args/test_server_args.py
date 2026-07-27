@@ -1715,7 +1715,7 @@ class TestGrpcServerArgs(CustomTestCase):
         from sglang.srt.entrypoints import http_server
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
-        fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
+        runtime_handle = MagicMock()
         server_args = SimpleNamespace(
             host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
         )
@@ -1724,14 +1724,11 @@ class TestGrpcServerArgs(CustomTestCase):
             {
                 "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
                 "sglang.srt.grpc._core": fake_core,
-                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
             },
         ):
             handle = http_server._start_native_grpc_server_for_runtime(
                 server_args=server_args,
-                tokenizer_manager=MagicMock(),
-                template_manager=MagicMock(),
-                scheduler_info={},
+                runtime_handle=runtime_handle,
             )
 
         self.assertEqual(handle, "handle")
@@ -1740,6 +1737,37 @@ class TestGrpcServerArgs(CustomTestCase):
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
         )
         self.assertNotIn("max_prefill_tokens", kwargs)
+
+
+class TestOpenEngineServerArgs(CustomTestCase):
+    @staticmethod
+    def _args(**kwargs):
+        return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_openengine_is_disabled_by_default(self):
+        args = self._args()
+        args._handle_deprecated_args()
+        self.assertIsNone(args.openengine_port)
+        self.assertEqual(args.openengine_host, "127.0.0.1")
+        self.assertIsNone(args.openengine_advertise_host)
+
+    def test_openengine_rejects_unsupported_launch_paths(self):
+        for kwargs in (
+            {"tokenizer_worker_num": 2},
+            {"use_ray": True},
+            {"smg_grpc_mode": True},
+            {"api_key": "secret"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                args = self._args(openengine_port=50052, **kwargs)
+                with self.assertRaises(ValueError):
+                    args._handle_deprecated_args()
+
+    def test_openengine_and_native_grpc_can_share_runtime(self):
+        args = self._args(grpc_port=50051, openengine_port=50052)
+        args._handle_deprecated_args()
+        self.assertEqual(args.grpc_port, 50051)
+        self.assertEqual(args.openengine_port, 50052)
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):

@@ -60,7 +60,14 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
+    __slots__ = (
+        "token_ids",
+        "extra_key",
+        "is_bigram",
+        "limit",
+        "lora_name",
+        "cache_salt",
+    )
 
     def __init__(
         self,
@@ -68,6 +75,8 @@ class RadixKey:
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
         limit: Optional[int] = None,
+        lora_name: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
@@ -78,6 +87,12 @@ class RadixKey:
         # Optional cap on raw tokens: behave as if token_ids were sliced to
         # token_ids[:limit], without the O(n) copy. None = use all tokens.
         self.limit = limit
+        # Routing-only metadata. Prefix-cache equality continues to use the
+        # internal ``extra_key`` (which contains the runtime LoRA ID), while KV
+        # events expose this stable name so external routers share Dynamo's
+        # adapter namespace.
+        self.lora_name = lora_name
+        self.cache_salt = cache_salt
 
     def _raw_len(self) -> int:
         n = len(self.token_ids)
@@ -126,8 +141,19 @@ class RadixKey:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
             raw = self.token_ids[start : stop + 1] if stop > start else array("q")
-            return RadixKey(raw, self.extra_key, is_bigram=True)
-        return RadixKey(self.token_ids[start:stop], self.extra_key)
+            return RadixKey(
+                raw,
+                self.extra_key,
+                is_bigram=True,
+                lora_name=self.lora_name,
+                cache_salt=self.cache_salt,
+            )
+        return RadixKey(
+            self.token_ids[start:stop],
+            self.extra_key,
+            lora_name=self.lora_name,
+            cache_salt=self.cache_salt,
+        )
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
@@ -456,7 +482,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            lora_name=getattr(req, "lora_name", None),
+            cache_salt=getattr(req, "cache_salt", None),
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
@@ -498,7 +528,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            lora_name=getattr(req, "lora_name", None),
+            cache_salt=getattr(req, "cache_salt", None),
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 

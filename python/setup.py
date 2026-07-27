@@ -26,10 +26,12 @@ Two filters can narrow the discovered set:
 import json
 import os
 import re
+import runpy
 import subprocess
 from pathlib import Path
 
 from setuptools import setup
+from setuptools.command.build_py import build_py
 
 try:
     from setuptools_rust import Binding, RustExtension, build_rust
@@ -43,6 +45,25 @@ except ModuleNotFoundError as exc:
 _BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
 _PYTHON_DIR = Path(__file__).resolve().parent
 _RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
+
+
+class BuildPy(build_py):
+    """Generate optional OpenEngine bindings before copying Python modules."""
+
+    def run(self) -> None:
+        generator = runpy.run_path(
+            str(
+                _PYTHON_DIR
+                / "sglang"
+                / "srt"
+                / "entrypoints"
+                / "openengine"
+                / "generate.py"
+            )
+        )
+        if generator["generation_input_available"]():
+            generator["generate_openengine"](output=_PYTHON_DIR)
+        super().run()
 
 
 def _cargo_workspace_metadata():
@@ -178,6 +199,9 @@ def _declared_rust_extensions():
     return _pyproject_rust_extensions(_discovered_rust_extensions())
 
 
+cmdclass = {"build_py": BuildPy}
+setup_args = {"cmdclass": cmdclass}
+
 if build_rust is not None:
 
     class BuildRust(build_rust):
@@ -191,9 +215,7 @@ if build_rust is not None:
                 return
             super().run()
 
-    setup(
-        cmdclass={"build_rust": BuildRust},
-        rust_extensions=_declared_rust_extensions(),
-    )
-else:
-    setup()
+    cmdclass["build_rust"] = BuildRust
+    setup_args["rust_extensions"] = _declared_rust_extensions()
+
+setup(**setup_args)

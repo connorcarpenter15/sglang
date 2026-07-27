@@ -1170,6 +1170,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            if obj.lora_path is not None and not isinstance(obj.lora_path, str):
+                raise ValueError(
+                    "tokenizing one request requires a single LoRA adapter name"
+                )
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -1199,6 +1203,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
+                lora_name=obj.lora_path,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
