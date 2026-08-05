@@ -237,10 +237,10 @@ impl ChunkCallback {
             .get_item("embedding")?
             .and_then(|v| v.extract::<Vec<f32>>().ok());
 
-        let choice_index = chunk
+        let output_index = chunk
             .get_item("index")?
-            .and_then(|v| v.extract::<i32>().ok())
-            .unwrap_or(0);
+            .map(|value| value.extract::<u32>())
+            .transpose()?;
 
         let meta_info = extract_meta_info(chunk);
 
@@ -249,7 +249,7 @@ impl ChunkCallback {
             output_ids,
             delta_output_ids,
             embedding,
-            choice_index,
+            output_index,
             json_bytes: None,
             meta_info,
         };
@@ -347,7 +347,7 @@ impl JsonChunkCallback {
             output_ids: None,
             delta_output_ids: None,
             embedding: None,
-            choice_index: 0,
+            output_index: None,
             json_bytes: Some(bytes_data),
             meta_info,
         };

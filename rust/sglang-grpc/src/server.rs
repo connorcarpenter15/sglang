@@ -243,7 +243,7 @@ fn finish_reason_value(
 
 struct ChoiceTracker {
     expected: usize,
-    terminal: HashSet<i32>,
+    terminal: HashSet<u32>,
 }
 
 impl ChoiceTracker {
@@ -256,23 +256,23 @@ impl ChoiceTracker {
 
     fn observe(
         &mut self,
-        choice_index: i32,
-        choice_terminal: bool,
+        output_index: u32,
+        output_terminal: bool,
         request_finished: bool,
     ) -> Result<bool, String> {
-        if choice_index < 0 || choice_index as usize >= self.expected {
+        if output_index as usize >= self.expected {
             return Err(format!(
-                "SGLang returned choice index {choice_index} outside 0..{}",
+                "SGLang returned output index {output_index} outside 0..{}",
                 self.expected
             ));
         }
-        if self.terminal.contains(&choice_index) {
+        if self.terminal.contains(&output_index) {
             return Err(format!(
-                "SGLang returned data after terminal for choice {choice_index}"
+                "SGLang returned data after terminal for output {output_index}"
             ));
         }
-        if choice_terminal {
-            self.terminal.insert(choice_index);
+        if output_terminal {
+            self.terminal.insert(output_index);
         }
         if request_finished && self.terminal.len() != self.expected {
             return Err(format!(
@@ -286,34 +286,33 @@ impl ChoiceTracker {
 }
 
 enum GenerationTerminal {
-    Finish(proto::GenerationFinish),
+    Finished(proto::GenerationFinished),
     Error(proto::GenerationError),
 }
 
-fn generation_terminal(finish_reason: Option<&serde_json::Value>) -> GenerationTerminal {
-    let Some(value) = finish_reason else {
-        return GenerationTerminal::Error(proto::GenerationError {
-            code: proto::GenerationErrorCode::Internal as i32,
-            message: "SGLang stream ended without finish_reason".into(),
-            retryable: false,
-        });
-    };
+fn generation_terminal(
+    value: &serde_json::Value,
+    output_index: Option<u32>,
+    requested_stop_token_ids: &HashSet<u32>,
+) -> Result<GenerationTerminal, String> {
     let finish_type = value
         .get("type")
         .and_then(serde_json::Value::as_str)
         .or_else(|| value.as_str())
-        .unwrap_or("error");
+        .ok_or_else(|| "SGLang returned finish_reason without a string type".to_string())?;
     if matches!(finish_type, "abort" | "error") {
         let status_code = value.get("status_code").and_then(serde_json::Value::as_i64);
-        let (code, retryable) = match status_code {
-            Some(408 | 504) => (proto::GenerationErrorCode::DeadlineExceeded, true),
-            Some(499) => (proto::GenerationErrorCode::Cancelled, false),
-            Some(400..=499) => (proto::GenerationErrorCode::InvalidArgument, false),
-            Some(503) => (proto::GenerationErrorCode::Unavailable, true),
-            None if finish_type == "abort" => (proto::GenerationErrorCode::Cancelled, false),
-            _ => (proto::GenerationErrorCode::Internal, false),
+        let error_type = value.get("err_type").and_then(serde_json::Value::as_str);
+        let (code, retryable) = match (status_code, error_type) {
+            (_, Some("NotImplementedError")) => (proto::ErrorCode::UnsupportedFeature, false),
+            (Some(429 | 503), _) => (proto::ErrorCode::Overloaded, true),
+            (Some(499), _) => (proto::ErrorCode::Cancelled, false),
+            (Some(408 | 504), _) => (proto::ErrorCode::Internal, true),
+            (Some(400..=499), _) => (proto::ErrorCode::InvalidArgument, false),
+            (None, _) if finish_type == "abort" => (proto::ErrorCode::Cancelled, false),
+            _ => (proto::ErrorCode::Internal, false),
         };
-        return GenerationTerminal::Error(proto::GenerationError {
+        return Ok(GenerationTerminal::Error(proto::GenerationError {
             code: code as i32,
             message: value
                 .get("message")
@@ -321,33 +320,48 @@ fn generation_terminal(finish_reason: Option<&serde_json::Value>) -> GenerationT
                 .unwrap_or("SGLang generation failed")
                 .to_string(),
             retryable,
-        });
+        }));
     }
 
     let reason = match finish_type {
         "stop" => proto::FinishReason::Stop,
         "length" => proto::FinishReason::Length,
         "cancelled" => proto::FinishReason::Cancelled,
-        _ => proto::FinishReason::Unspecified,
+        other => {
+            return Err(format!(
+                "SGLang returned unknown finish_reason type {other:?}"
+            ));
+        }
     };
-    let stop_reason = value.get("matched").and_then(|matched| {
-        use proto::stop_reason::Reason;
-        let reason = if let Some(value) = matched.as_str() {
-            Some(Reason::MatchedString(value.to_string()))
+    let output_index = output_index
+        .ok_or_else(|| "SGLang returned an output terminal without an output index".to_string())?;
+    let stop_match = value.get("matched").and_then(|matched| {
+        use proto::stop_match::Match;
+        let r#match = if let Some(value) = matched.as_str() {
+            Some(Match::StopText(value.to_string()))
+        } else if let Some(value) = matched.as_u64().and_then(|value| u32::try_from(value).ok()) {
+            if requested_stop_token_ids.contains(&value) {
+                Some(Match::StopTokenId(value))
+            } else {
+                Some(Match::EosTokenId(value))
+            }
         } else {
-            matched
-                .as_i64()
-                .and_then(|value| i32::try_from(value).ok())
-                .map(Reason::MatchedTokenId)
+            None
         }?;
-        Some(proto::StopReason {
-            reason: Some(reason),
+        Some(proto::StopMatch {
+            r#match: Some(r#match),
         })
     });
-    GenerationTerminal::Finish(proto::GenerationFinish {
+    Ok(GenerationTerminal::Finished(proto::GenerationFinished {
+        output_index: Some(output_index),
         reason: reason as i32,
-        stop_reason,
-    })
+        message: value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        stop_match,
+    }))
 }
 
 #[tonic::async_trait]
@@ -435,10 +449,21 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
         let expected_choices = expected_generation_choices(&req).map_err(|status| *status)?;
+        let requested_stop_token_ids = req
+            .sampling_params
+            .as_ref()
+            .map(|params| {
+                params
+                    .stop_token_ids
+                    .iter()
+                    .filter_map(|&token_id| u32::try_from(token_id).ok())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
 
         let SubmittedRequest { key, mut receiver } = self
             .bridge
-            .submit_request(&rid, "generate", req_dict, expected_choices > 1)
+            .submit_request(&rid, "generate", req_dict, true)
             .map_err(|e| pyerr_to_status(e, "Failed to submit request"))?;
 
         let bridge = self.bridge.clone();
@@ -464,10 +489,60 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                                 break;
                             }
                         };
-                        let choice_terminal = request_finished || finish_reason.is_some();
+                        if request_finished && finish_reason.is_none() {
+                            abort_guard.abort_now();
+                            yield Err(Status::internal(
+                                "SGLang closed Generate without a terminal finish_reason",
+                            ));
+                            break;
+                        }
+                        let terminal = match finish_reason.as_ref() {
+                            Some(value) => match generation_terminal(
+                                value,
+                                data.output_index,
+                                &requested_stop_token_ids,
+                            ) {
+                                Ok(terminal) => Some(terminal),
+                                Err(error) => {
+                                    abort_guard.abort_now();
+                                    yield Err(Status::internal(error));
+                                    break;
+                                }
+                            },
+                            None => None,
+                        };
+                        let output_ids = data.output_ids.unwrap_or_default();
+                        if let Some(GenerationTerminal::Error(error)) = terminal.as_ref() {
+                            if !request_finished || data.output_index.is_some() {
+                                abort_guard.abort_now();
+                                yield Err(Status::internal(
+                                    "SGLang GenerationError must be one final request-scoped event",
+                                ));
+                                break;
+                            }
+                            abort_guard.disarm();
+                            yield Ok(proto::GenerateResponse {
+                                delta_output_ids: data.delta_output_ids.unwrap_or_default(),
+                                output_ids,
+                                meta_info: data.meta_info,
+                                finished: true,
+                                request_id: public_rid.clone(),
+                                output_index: None,
+                                terminal: Some(proto::generate_response::Terminal::Error(error.clone())),
+                            });
+                            break;
+                        }
+                        let Some(output_index) = data.output_index else {
+                            abort_guard.abort_now();
+                            yield Err(Status::internal(
+                                "SGLang output event is missing its output index",
+                            ));
+                            break;
+                        };
+                        let output_terminal = matches!(&terminal, Some(GenerationTerminal::Finished(_)));
                         let all_terminal = match choices.observe(
-                            data.choice_index,
-                            choice_terminal,
+                            output_index,
+                            output_terminal,
                             request_finished,
                         ) {
                             Ok(all_terminal) => all_terminal,
@@ -477,14 +552,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                                 break;
                             }
                         };
-                        let output_ids = data.output_ids.unwrap_or_default();
-                        let terminal = choice_terminal.then(|| match generation_terminal(finish_reason.as_ref()) {
-                            GenerationTerminal::Finish(finish) => {
-                                proto::generate_response::Terminal::Finish(finish)
+                        let terminal = terminal.map(|terminal| match terminal {
+                            GenerationTerminal::Finished(finished) => {
+                                proto::generate_response::Terminal::GenerationFinished(finished)
                             }
-                            GenerationTerminal::Error(error) => {
-                                proto::generate_response::Terminal::Error(error)
-                            }
+                            GenerationTerminal::Error(_) => unreachable!(),
                         });
                         if all_terminal {
                             abort_guard.disarm();
@@ -497,7 +569,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             meta_info: data.meta_info,
                             finished: request_finished,
                             request_id: public_rid.clone(),
-                            choice_index: data.choice_index,
+                            output_index: Some(output_index),
                             terminal,
                         });
                         if all_terminal {

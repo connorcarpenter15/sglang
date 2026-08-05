@@ -57,7 +57,7 @@ async fn stale_request_key_cannot_abort_reused_request_id() {
 }
 
 #[test]
-fn explicit_abort_keeps_choice_aware_channel_for_terminal_errors() {
+fn explicit_abort_keeps_structured_error_channel_open() {
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
     let key = RequestKey {
         rid: "multi-choice".to_string(),

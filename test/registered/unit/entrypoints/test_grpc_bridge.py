@@ -77,7 +77,7 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 callback,
                 stream=False,
                 request=None,
-                choice_aware=True,
+                structured_errors=True,
             )
         )
 
@@ -127,7 +127,7 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 callback,
                 stream=True,
                 request=None,
-                choice_aware=True,
+                structured_errors=True,
             )
         )
 
@@ -144,7 +144,7 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [call[1] for call in callback.calls], [False, False, False, True]
         )
 
-    def test_generation_error_terminates_each_unfinished_choice(self):
+    def test_generation_error_terminates_the_request_once(self):
         callback = _RecordingCallback()
         responses = [
             {
@@ -171,15 +171,17 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 callback,
                 stream=True,
                 request=None,
-                choice_aware=True,
+                structured_errors=True,
             )
         )
 
-        self.assertEqual([call[0]["index"] for call in callback.calls], [0, 1, 1])
+        self.assertEqual(
+            [call[0].get("index") for call in callback.calls], [0, 1, None]
+        )
         self.assertEqual(
             callback.calls[2][0]["meta_info"]["finish_reason"]["type"], "error"
         )
-        self.assertEqual(callback.calls[2][0]["output_ids"], [7])
+        self.assertEqual(callback.calls[2][0]["output_ids"], [])
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
 
     def test_incremental_streaming_preserves_legacy_segments(self):
@@ -205,7 +207,7 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
                 callback,
                 stream=True,
                 request=None,
-                choice_aware=True,
+                structured_errors=True,
             )
         )
 

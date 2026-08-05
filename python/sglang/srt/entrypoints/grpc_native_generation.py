@@ -28,41 +28,48 @@ class NativeGenerationAdapter:
             }
         }
 
-    async def _send_generation_errors(
+    async def _send_generation_error(
         self,
         chunk_callback,
         ready_event: Optional[asyncio.Event],
         *,
-        error: Exception,
-        expected_choices: int,
-        terminal_choices: set,
-        error_outputs: dict,
+        error: Optional[Exception] = None,
+        meta_info: Optional[dict] = None,
         timeout_abort_rid,
         timeout_abort_lifecycle_id,
     ) -> None:
-        unfinished = [
-            index for index in range(expected_choices) if index not in terminal_choices
-        ]
-        for position, index in enumerate(unfinished):
-            keep_going = await self._send_with_backpressure(
-                chunk_callback,
-                ready_event,
-                {
-                    "index": index,
-                    "output_ids": error_outputs.get(index, []),
-                    "delta_output_ids": [],
-                    "meta_info": self._generation_error_meta(error),
-                },
-                finished=position == len(unfinished) - 1,
-                timeout_abort_rid=timeout_abort_rid,
-                timeout_abort_lifecycle_id=timeout_abort_lifecycle_id,
+        if meta_info is None:
+            if error is None:
+                raise ValueError("structured generation error requires error metadata")
+            meta_info = self._generation_error_meta(error)
+        keep_going = await self._send_with_backpressure(
+            chunk_callback,
+            ready_event,
+            {
+                "output_ids": [],
+                "delta_output_ids": [],
+                "meta_info": meta_info,
+            },
+            finished=True,
+            timeout_abort_rid=timeout_abort_rid,
+            timeout_abort_lifecycle_id=timeout_abort_lifecycle_id,
+        )
+        if not keep_going:
+            self._abort_request_id(
+                timeout_abort_rid,
+                timeout_abort_lifecycle_id,
             )
-            if not keep_going:
-                self._abort_request_id(
-                    timeout_abort_rid,
-                    timeout_abort_lifecycle_id,
-                )
-                return
+
+    @staticmethod
+    def _scheduler_error_meta(chunk: dict) -> Optional[dict]:
+        meta_info = chunk.get("meta_info") or {}
+        finish_reason = meta_info.get("finish_reason")
+        if isinstance(finish_reason, dict) and finish_reason.get("type") in (
+            "abort",
+            "error",
+        ):
+            return {"finish_reason": finish_reason}
+        return None
 
     async def _run_generate(
         self,
@@ -71,7 +78,7 @@ class NativeGenerationAdapter:
         stream: bool,
         request,
         *,
-        choice_aware: bool = False,
+        structured_errors: bool = False,
         lifecycle_id=None,
     ):
         ready_event = None
@@ -85,14 +92,13 @@ class NativeGenerationAdapter:
             parallel_sample_num = getattr(obj, "parallel_sample_num", 1)
         expected_choices = max(1, int(parallel_sample_num))
         terminal_choices = set()
-        error_outputs = {}
         try:
             ready_event = self._install_on_ready(chunk_callback)
             generate_kwargs = {
                 "request": request,
                 "request_lifecycle_id": lifecycle_id,
             }
-            if choice_aware:
+            if structured_errors:
                 generate_kwargs["yield_scheduler_errors"] = True
             gen = self.tokenizer_manager.generate_request(obj, **generate_kwargs)
             if stream:
@@ -105,42 +111,52 @@ class NativeGenerationAdapter:
                 )
                 output_counts = {index: 0 for index in range(expected_choices)}
                 async for chunk in gen:
-                    choice_index = int(chunk.get("index") or 0)
-                    if not 0 <= choice_index < expected_choices:
-                        self._abort_request_id(obj.rid, lifecycle_id)
-                        self._send_native_error(
+                    if (
+                        structured_errors
+                        and (error_meta := self._scheduler_error_meta(chunk))
+                        is not None
+                    ):
+                        await self._send_generation_error(
                             chunk_callback,
-                            f"choice index {choice_index} is outside 0..{expected_choices}",
+                            ready_event,
+                            meta_info=error_meta,
+                            timeout_abort_rid=obj.rid,
+                            timeout_abort_lifecycle_id=lifecycle_id,
                         )
                         return
-                    if choice_index in terminal_choices:
+                    output_index = int(chunk.get("index") or 0)
+                    if not 0 <= output_index < expected_choices:
                         self._abort_request_id(obj.rid, lifecycle_id)
                         self._send_native_error(
                             chunk_callback,
-                            f"data after terminal for choice {choice_index}",
+                            f"output index {output_index} is outside 0..{expected_choices}",
+                        )
+                        return
+                    if output_index in terminal_choices:
+                        self._abort_request_id(obj.rid, lifecycle_id)
+                        self._send_native_error(
+                            chunk_callback,
+                            f"data after terminal for output {output_index}",
                         )
                         return
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
                     )
                     if choice_finished:
-                        terminal_choices.add(choice_index)
+                        terminal_choices.add(output_index)
                     finished = len(terminal_choices) == expected_choices
                     callback_chunk = dict(chunk)
+                    callback_chunk["index"] = output_index
                     output_ids = chunk.get("output_ids") or []
                     if incremental:
                         callback_chunk["delta_output_ids"] = output_ids
-                        error_outputs[choice_index] = []
                     else:
-                        previous_count = output_counts[choice_index]
+                        previous_count = output_counts[output_index]
                         delta_start = (
                             previous_count if previous_count <= len(output_ids) else 0
                         )
                         callback_chunk["delta_output_ids"] = output_ids[delta_start:]
-                        output_counts[choice_index] = len(output_ids)
-                        error_outputs[choice_index] = output_ids
-                    if choice_finished:
-                        error_outputs.pop(choice_index, None)
+                        output_counts[output_index] = len(output_ids)
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
@@ -156,14 +172,11 @@ class NativeGenerationAdapter:
                 error = RuntimeError(
                     f"SGLang stream ended without terminal choices: {missing}"
                 )
-                if choice_aware:
-                    await self._send_generation_errors(
+                if structured_errors:
+                    await self._send_generation_error(
                         chunk_callback,
                         ready_event,
                         error=error,
-                        expected_choices=expected_choices,
-                        terminal_choices=terminal_choices,
-                        error_outputs=error_outputs,
                         timeout_abort_rid=obj.rid,
                         timeout_abort_lifecycle_id=lifecycle_id,
                     )
@@ -172,18 +185,28 @@ class NativeGenerationAdapter:
             else:
                 result = await gen.__anext__()
                 chunks = result if isinstance(result, list) else [result]
+                if structured_errors:
+                    for chunk in chunks:
+                        if (
+                            error_meta := self._scheduler_error_meta(chunk)
+                        ) is not None:
+                            await self._send_generation_error(
+                                chunk_callback,
+                                ready_event,
+                                meta_info=error_meta,
+                                timeout_abort_rid=obj.rid,
+                                timeout_abort_lifecycle_id=lifecycle_id,
+                            )
+                            return
                 if len(chunks) != expected_choices:
                     error = RuntimeError(
                         f"SGLang returned {len(chunks)} choices; expected {expected_choices}"
                     )
-                    if choice_aware:
-                        await self._send_generation_errors(
+                    if structured_errors:
+                        await self._send_generation_error(
                             chunk_callback,
                             ready_event,
                             error=error,
-                            expected_choices=expected_choices,
-                            terminal_choices=terminal_choices,
-                            error_outputs=error_outputs,
                             timeout_abort_rid=obj.rid,
                             timeout_abort_lifecycle_id=lifecycle_id,
                         )
@@ -209,14 +232,11 @@ class NativeGenerationAdapter:
                         return
         except StopAsyncIteration:
             error = RuntimeError("SGLang returned no generation result")
-            if choice_aware:
-                await self._send_generation_errors(
+            if structured_errors:
+                await self._send_generation_error(
                     chunk_callback,
                     ready_event,
                     error=error,
-                    expected_choices=expected_choices,
-                    terminal_choices=terminal_choices,
-                    error_outputs=error_outputs,
                     timeout_abort_rid=obj.rid,
                     timeout_abort_lifecycle_id=lifecycle_id,
                 )
@@ -226,14 +246,11 @@ class NativeGenerationAdapter:
             raise
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            if choice_aware:
-                await self._send_generation_errors(
+            if structured_errors:
+                await self._send_generation_error(
                     chunk_callback,
                     ready_event,
                     error=e,
-                    expected_choices=expected_choices,
-                    terminal_choices=terminal_choices,
-                    error_outputs=error_outputs,
                     timeout_abort_rid=obj.rid,
                     timeout_abort_lifecycle_id=lifecycle_id,
                 )

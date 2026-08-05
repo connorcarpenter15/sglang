@@ -33,7 +33,7 @@ pub struct ResponseData {
     pub output_ids: Option<Vec<i32>>,
     pub delta_output_ids: Option<Vec<i32>>,
     pub embedding: Option<Vec<f32>>,
-    pub choice_index: i32,
+    pub output_index: Option<u32>,
     pub json_bytes: Option<Vec<u8>>,
     pub meta_info: HashMap<String, String>,
 }
@@ -241,9 +241,9 @@ impl PyBridge {
         rid: &str,
         req_type: &str,
         req_dict: HashMap<String, serde_json::Value>,
-        choice_aware: bool,
+        structured_errors: bool,
     ) -> PyResult<SubmittedRequest> {
-        let submitted = self.create_channel(rid, choice_aware, true)?;
+        let submitted = self.create_channel(rid, structured_errors, true)?;
 
         let result = Python::attach(|py| -> PyResult<()> {
             let py_req_dict = json_map_to_pydict(py, &req_dict)?;
@@ -253,7 +253,7 @@ impl PyBridge {
             kwargs.set_item("req_type", req_type)?;
             kwargs.set_item("req_dict", py_req_dict)?;
             kwargs.set_item("chunk_callback", callback)?;
-            kwargs.set_item("choice_aware", choice_aware)?;
+            kwargs.set_item("structured_errors", structured_errors)?;
             kwargs.set_item("lifecycle_id", submitted.key.incarnation())?;
 
             self.runtime_handle
@@ -274,18 +274,16 @@ impl PyBridge {
                             channel.abort_requested
                         })
                 };
-                if abort_requested {
-                    if let Err(err) = self.abort_runtime_request(&submitted.key) {
-                        let mut state = lock_or_recover(self.state.as_ref(), "state");
-                        if let Some(channel) = state
-                            .channels
-                            .get_mut(submitted.key.rid())
-                            .filter(|channel| channel.incarnation == submitted.key.incarnation)
-                        {
-                            channel.abort_requested = false;
-                        }
-                        return Err(err);
+                if abort_requested && let Err(err) = self.abort_runtime_request(&submitted.key) {
+                    let mut state = lock_or_recover(self.state.as_ref(), "state");
+                    if let Some(channel) = state
+                        .channels
+                        .get_mut(submitted.key.rid())
+                        .filter(|channel| channel.incarnation == submitted.key.incarnation)
+                    {
+                        channel.abort_requested = false;
                     }
+                    return Err(err);
                 }
                 Ok(submitted)
             }

@@ -279,7 +279,7 @@ class RuntimeHandle(NativeGenerationAdapter):
         req_type: str,
         req_dict: dict,
         chunk_callback,
-        choice_aware: bool = False,
+        structured_errors: bool = False,
         lifecycle_id=None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
@@ -299,7 +299,7 @@ class RuntimeHandle(NativeGenerationAdapter):
                     chunk_callback,
                     stream,
                     mock_request,
-                    choice_aware=choice_aware,
+                    structured_errors=structured_errors,
                     lifecycle_id=lifecycle_id,
                 )
             )

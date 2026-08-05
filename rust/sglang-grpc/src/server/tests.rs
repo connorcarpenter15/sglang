@@ -4,7 +4,7 @@ use super::{
 };
 use crate::bridge::TerminalError;
 use crate::proto;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tonic::Code;
 
 #[test]
@@ -52,17 +52,28 @@ fn choice_tracker_requires_one_terminal_per_choice() {
 }
 
 #[test]
-fn generation_terminal_maps_stop_and_scheduler_error() {
+fn generation_terminal_maps_openengine_finish_and_error_fields() {
+    let requested_stop_token_ids = HashSet::from([7]);
     let stop = serde_json::json!({"type": "stop", "matched": "END"});
-    match generation_terminal(Some(&stop)) {
-        GenerationTerminal::Finish(finish) => {
+    match generation_terminal(&stop, Some(0), &requested_stop_token_ids).unwrap() {
+        GenerationTerminal::Finished(finish) => {
+            assert_eq!(finish.output_index, Some(0));
             assert_eq!(finish.reason, proto::FinishReason::Stop as i32);
             assert!(matches!(
-                finish.stop_reason.and_then(|reason| reason.reason),
-                Some(proto::stop_reason::Reason::MatchedString(value)) if value == "END"
+                finish.stop_match.and_then(|stop_match| stop_match.r#match),
+                Some(proto::stop_match::Match::StopText(value)) if value == "END"
             ));
         }
         GenerationTerminal::Error(_) => panic!("expected a finish terminal"),
+    }
+
+    let eos = serde_json::json!({"type": "stop", "matched": 42});
+    match generation_terminal(&eos, Some(1), &requested_stop_token_ids).unwrap() {
+        GenerationTerminal::Finished(finish) => assert!(matches!(
+            finish.stop_match.and_then(|stop_match| stop_match.r#match),
+            Some(proto::stop_match::Match::EosTokenId(42))
+        )),
+        GenerationTerminal::Error(_) => panic!("expected an EOS finish terminal"),
     }
 
     let error = serde_json::json!({
@@ -70,13 +81,13 @@ fn generation_terminal_maps_stop_and_scheduler_error() {
         "status_code": 503,
         "message": "busy"
     });
-    match generation_terminal(Some(&error)) {
+    match generation_terminal(&error, None, &requested_stop_token_ids).unwrap() {
         GenerationTerminal::Error(error) => {
-            assert_eq!(error.code, proto::GenerationErrorCode::Unavailable as i32);
+            assert_eq!(error.code, proto::ErrorCode::Overloaded as i32);
             assert!(error.retryable);
             assert_eq!(error.message, "busy");
         }
-        GenerationTerminal::Finish(_) => panic!("expected an error terminal"),
+        GenerationTerminal::Finished(_) => panic!("expected an error terminal"),
     }
 }
 
