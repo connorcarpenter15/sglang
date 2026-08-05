@@ -467,18 +467,31 @@ def _make_generate_obj(rid, is_single):
 class TestDiscardPendingReqStates(CustomTestCase):
     """Direct tests for _discard_pending_req_states."""
 
-    def test_discard_single_aborts_scheduler_before_cleanup(self):
+    def test_discard_single_blocks_reuse_until_scheduler_abort_ack(self):
         tm = _make_tokenizer_manager()
         rid = "d_single"
-        tm.rid_to_state[rid] = _make_req_state(rid, dispatched=True)
+        state = _make_req_state(rid, dispatched=True)
+        tm.rid_to_state[rid] = state
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = True
         obj.rid = rid
+
         tm._discard_pending_req_states(obj)
-        self.assertNotIn(rid, tm.rid_to_state)
+
         abort_req = tm._dispatch_to_scheduler.call_args.args[0]
         self.assertEqual(abort_req.rid, rid)
         self.assertFalse(abort_req.abort_all)
+        self.assertIs(tm.rid_to_state[rid], state)
+        self.assertTrue(state.abort_requested)
+
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            tm._init_req_state(_make_generate_obj(rid, is_single=True))
+
+        tm._handle_abort_req(_make_abort_req(rid))
+        self.assertNotIn(rid, tm.rid_to_state)
+
+        tm._init_req_state(_make_generate_obj(rid, is_single=True))
+        self.assertIn(rid, tm.rid_to_state)
 
     def test_discard_unsent_batch_without_scheduler_abort(self):
         tm = _make_tokenizer_manager()
@@ -503,7 +516,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
 
-    def test_parallel_cleanup_aborts_children_and_allows_parent_reuse(self):
+    def test_parallel_cleanup_blocks_parent_reuse_until_children_ack_abort(self):
         tm = _make_tokenizer_manager()
         parent = _make_generate_obj("parent", is_single=True)
         lifecycle_ids = tm._init_req_state(parent)
@@ -521,6 +534,24 @@ class TestDiscardPendingReqStates(CustomTestCase):
             call.args[0].rid for call in tm._dispatch_to_scheduler.call_args_list
         }
         self.assertEqual(aborted_rids, child_rids)
+        self.assertEqual(set(tm.rid_to_state), child_rids)
+        self.assertEqual(tm.logical_rid_to_child_rids["parent"], child_rids)
+        self.assertEqual(
+            tm.child_rid_to_logical_rid,
+            {child_rid: "parent" for child_rid in child_rids},
+        )
+
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            tm._init_req_state(_make_generate_obj("parent", is_single=True))
+
+        acknowledged_rids = sorted(child_rids)
+        for child_rid in acknowledged_rids[:-1]:
+            tm._handle_abort_req(_make_abort_req(child_rid))
+
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            tm._init_req_state(_make_generate_obj("parent", is_single=True))
+
+        tm._handle_abort_req(_make_abort_req(acknowledged_rids[-1]))
         self.assertFalse(tm.rid_to_state)
         self.assertFalse(tm.logical_rid_to_child_rids)
         self.assertFalse(tm.child_rid_to_logical_rid)
