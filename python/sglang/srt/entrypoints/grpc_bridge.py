@@ -105,18 +105,12 @@ class RuntimeHandle:
     def _is_closed_status(status) -> bool:
         return status is not None and status == type(status).Closed
 
-    def _abort_request_id(self, rid, lifecycle_id=None) -> None:
+    def _abort_request_id(self, rid) -> None:
         if isinstance(rid, list):
             for single_rid in rid:
-                self.tokenizer_manager.abort_request(
-                    rid=single_rid,
-                    lifecycle_id=lifecycle_id,
-                )
+                self.tokenizer_manager.abort_request(rid=single_rid)
         else:
-            self.tokenizer_manager.abort_request(
-                rid=rid,
-                lifecycle_id=lifecycle_id,
-            )
+            self.tokenizer_manager.abort_request(rid=rid)
 
     async def _send_with_backpressure(
         self,
@@ -125,7 +119,6 @@ class RuntimeHandle:
         payload,
         *,
         timeout_abort_rid=None,
-        timeout_abort_lifecycle_id=None,
         **kwargs,
     ) -> bool:
         status = self._safe_callback(chunk_callback, payload, **kwargs)
@@ -145,10 +138,7 @@ class RuntimeHandle:
             )
         except asyncio.TimeoutError:
             if timeout_abort_rid is not None:
-                self._abort_request_id(
-                    timeout_abort_rid,
-                    timeout_abort_lifecycle_id,
-                )
+                self._abort_request_id(timeout_abort_rid)
                 logger.warning(
                     "gRPC chunk backpressure wait timed out after %ss; aborted request",
                     self._BACKPRESSURE_TIMEOUT_S,
@@ -260,7 +250,6 @@ class RuntimeHandle:
         error: Optional[Exception] = None,
         meta_info: Optional[dict] = None,
         timeout_abort_rid,
-        timeout_abort_lifecycle_id,
     ) -> None:
         if meta_info is None:
             if error is None:
@@ -276,13 +265,9 @@ class RuntimeHandle:
             },
             finished=True,
             timeout_abort_rid=timeout_abort_rid,
-            timeout_abort_lifecycle_id=timeout_abort_lifecycle_id,
         )
         if not keep_going:
-            self._abort_request_id(
-                timeout_abort_rid,
-                timeout_abort_lifecycle_id,
-            )
+            self._abort_request_id(timeout_abort_rid)
 
     @staticmethod
     def _scheduler_error_meta(chunk: dict) -> Optional[dict]:
@@ -303,7 +288,6 @@ class RuntimeHandle:
         request,
         *,
         structured_errors: bool = False,
-        lifecycle_id=None,
     ):
         ready_event = None
         gen = None
@@ -318,10 +302,7 @@ class RuntimeHandle:
         terminal_choices = set()
         try:
             ready_event = self._install_on_ready(chunk_callback)
-            generate_kwargs = {
-                "request": request,
-                "request_lifecycle_id": lifecycle_id,
-            }
+            generate_kwargs = {"request": request}
             if structured_errors:
                 generate_kwargs["yield_scheduler_errors"] = True
             gen = self.tokenizer_manager.generate_request(obj, **generate_kwargs)
@@ -345,19 +326,18 @@ class RuntimeHandle:
                             ready_event,
                             meta_info=error_meta,
                             timeout_abort_rid=obj.rid,
-                            timeout_abort_lifecycle_id=lifecycle_id,
                         )
                         return
                     output_index = int(chunk.get("index") or 0)
                     if not 0 <= output_index < expected_choices:
-                        self._abort_request_id(obj.rid, lifecycle_id)
+                        self._abort_request_id(obj.rid)
                         self._send_native_error(
                             chunk_callback,
                             f"output index {output_index} is outside 0..{expected_choices}",
                         )
                         return
                     if output_index in terminal_choices:
-                        self._abort_request_id(obj.rid, lifecycle_id)
+                        self._abort_request_id(obj.rid)
                         self._send_native_error(
                             chunk_callback,
                             f"data after terminal for output {output_index}",
@@ -387,7 +367,6 @@ class RuntimeHandle:
                         callback_chunk,
                         finished=finished,
                         timeout_abort_rid=obj.rid,
-                        timeout_abort_lifecycle_id=lifecycle_id,
                     )
                     if finished or not keep_going:
                         return
@@ -401,7 +380,6 @@ class RuntimeHandle:
                         ready_event,
                         error=error,
                         timeout_abort_rid=obj.rid,
-                        timeout_abort_lifecycle_id=lifecycle_id,
                     )
                 else:
                     self._send_native_error(chunk_callback, str(error))
@@ -418,7 +396,6 @@ class RuntimeHandle:
                                 ready_event,
                                 meta_info=error_meta,
                                 timeout_abort_rid=obj.rid,
-                                timeout_abort_lifecycle_id=lifecycle_id,
                             )
                             return
                 if len(chunks) != expected_choices:
@@ -431,7 +408,6 @@ class RuntimeHandle:
                             ready_event,
                             error=error,
                             timeout_abort_rid=obj.rid,
-                            timeout_abort_lifecycle_id=lifecycle_id,
                         )
                     else:
                         self._send_native_error(chunk_callback, str(error))
@@ -449,7 +425,6 @@ class RuntimeHandle:
                         callback_chunk,
                         finished=index == len(chunks) - 1,
                         timeout_abort_rid=obj.rid,
-                        timeout_abort_lifecycle_id=lifecycle_id,
                     )
                     if not keep_going:
                         return
@@ -461,7 +436,6 @@ class RuntimeHandle:
                     ready_event,
                     error=error,
                     timeout_abort_rid=obj.rid,
-                    timeout_abort_lifecycle_id=lifecycle_id,
                 )
             else:
                 self._send_native_error(chunk_callback, str(error))
@@ -475,7 +449,6 @@ class RuntimeHandle:
                     ready_event,
                     error=e,
                     timeout_abort_rid=obj.rid,
-                    timeout_abort_lifecycle_id=lifecycle_id,
                 )
             else:
                 self._send_native_error(chunk_callback, str(e))
@@ -484,13 +457,9 @@ class RuntimeHandle:
                 await gen.aclose()
             self._uninstall_on_ready(chunk_callback)
 
-    async def _run_embed(self, obj, chunk_callback, request, *, lifecycle_id=None):
+    async def _run_embed(self, obj, chunk_callback, request):
         try:
-            gen = self.tokenizer_manager.generate_request(
-                obj,
-                request=request,
-                request_lifecycle_id=lifecycle_id,
-            )
+            gen = self.tokenizer_manager.generate_request(obj, request=request)
             result = await gen.__anext__()
             self._safe_callback(chunk_callback, result, finished=True)
         except StopAsyncIteration:
@@ -542,7 +511,6 @@ class RuntimeHandle:
         req_dict: dict,
         chunk_callback,
         structured_errors: bool = False,
-        lifecycle_id=None,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         mock_request = (
@@ -562,7 +530,6 @@ class RuntimeHandle:
                     stream,
                     mock_request,
                     structured_errors=structured_errors,
-                    lifecycle_id=lifecycle_id,
                 )
             )
         elif req_type == "embed":
@@ -574,7 +541,6 @@ class RuntimeHandle:
                     obj,
                     chunk_callback,
                     mock_request,
-                    lifecycle_id=lifecycle_id,
                 )
             )
         else:
@@ -590,7 +556,6 @@ class RuntimeHandle:
     def abort(
         self,
         rid: str = "",
-        lifecycle_id=None,
         abort_all: bool = False,
     ):
         """Abort a request by request ID or abort all active requests."""
@@ -605,11 +570,10 @@ class RuntimeHandle:
             return self.tokenizer_manager.abort_request(
                 rid=rid,
                 abort_all=abort_all,
-                lifecycle_id=lifecycle_id,
             )
 
         future = asyncio.run_coroutine_threadsafe(
-            self._abort_async(rid, lifecycle_id, abort_all),
+            self._abort_async(rid, abort_all),
             loop,
         )
         try:
@@ -624,11 +588,10 @@ class RuntimeHandle:
             )
             raise
 
-    async def _abort_async(self, rid: str, lifecycle_id, abort_all: bool) -> bool:
+    async def _abort_async(self, rid: str, abort_all: bool) -> bool:
         return self.tokenizer_manager.abort_request(
             rid=rid,
             abort_all=abort_all,
-            lifecycle_id=lifecycle_id,
         )
 
     def get_model_info(self) -> str:

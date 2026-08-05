@@ -4,7 +4,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -215,21 +214,6 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
         self.assertEqual(
             [call[0]["delta_output_ids"] for call in callback.calls], [[1], [2]]
         )
-
-
-class TestNativeGrpcRequestLifecycle(CustomTestCase):
-    def test_stale_lifecycle_cannot_abort_reused_request_id(self):
-        manager = TokenizerManager.__new__(TokenizerManager)
-        manager.rid_to_state = {
-            "reused": SimpleNamespace(lifecycle_id=2, abort_requested=False)
-        }
-        manager.child_rid_to_logical_rid = {}
-        manager.logical_rid_to_child_rids = {}
-
-        aborted = manager.abort_request("reused", lifecycle_id=1)
-
-        self.assertFalse(aborted)
-        self.assertFalse(manager.rid_to_state["reused"].abort_requested)
 
 
 if __name__ == "__main__":

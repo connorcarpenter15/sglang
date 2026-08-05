@@ -48,10 +48,6 @@ impl RequestKey {
     pub fn rid(&self) -> &str {
         &self.rid
     }
-
-    fn incarnation(&self) -> u64 {
-        self.incarnation
-    }
 }
 
 pub struct SubmittedRequest {
@@ -254,7 +250,6 @@ impl PyBridge {
             kwargs.set_item("req_dict", py_req_dict)?;
             kwargs.set_item("chunk_callback", callback)?;
             kwargs.set_item("structured_errors", structured_errors)?;
-            kwargs.set_item("lifecycle_id", submitted.key.incarnation())?;
 
             self.runtime_handle
                 .call_method(py, "submit_request", (), Some(&kwargs))?;
@@ -300,11 +295,8 @@ impl PyBridge {
 
     fn abort_runtime_request(&self, key: &RequestKey) -> PyResult<()> {
         Python::attach(|py| {
-            self.runtime_handle.call_method1(
-                py,
-                "abort",
-                (key.rid(), Some(key.incarnation()), false),
-            )?;
+            self.runtime_handle
+                .call_method1(py, "abort", (key.rid(), false))?;
             Ok(())
         })
     }
@@ -356,8 +348,7 @@ impl PyBridge {
 
         let call_result = if abort_all {
             Python::attach(|py| {
-                self.runtime_handle
-                    .call_method1(py, "abort", (rid, Option::<u64>::None, true))?;
+                self.runtime_handle.call_method1(py, "abort", (rid, true))?;
                 Ok(())
             })
         } else if call_runtime {
@@ -630,10 +621,7 @@ fn close_channel_with_error(
         }
         (should_abort, had_consumer, scheduler_backed)
     };
-    if should_abort
-        && let Err(err) =
-            runtime_handle.call_method1(py, "abort", (key.rid(), Some(key.incarnation()), false))
-    {
+    if should_abort && let Err(err) = runtime_handle.call_method1(py, "abort", (key.rid(), false)) {
         let mut state = lock_or_recover(state.as_ref(), "state");
         if let Some(channel) = state
             .channels

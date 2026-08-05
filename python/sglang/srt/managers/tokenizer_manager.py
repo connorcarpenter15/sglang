@@ -746,7 +746,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
         yield_scheduler_errors: bool = False,
-        request_lifecycle_id: Optional[object] = None,
     ):
         self.auto_create_handle_loop()
 
@@ -774,11 +773,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        request_lifecycles = self._init_req_state(
-            obj,
-            request,
-            lifecycle_id=request_lifecycle_id,
-        )
+        request_lifecycles = self._init_req_state(obj, request)
         try:
             if self.server_args.language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -1973,7 +1968,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         rid: str = "",
         abort_all: bool = False,
-        lifecycle_id: Optional[object] = None,
     ) -> bool:
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
@@ -1986,16 +1980,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             target_rids = (rid,)
         elif rid in self.child_rid_to_logical_rid:
             # Preserve direct child aborts for internal callers.
-            state = self.rid_to_state.get(rid)
-            if state is None or (
-                lifecycle_id is not None and state.lifecycle_id != lifecycle_id
-            ):
-                return False
             target_rids = (rid,)
         elif rid in self.rid_to_state:
             state = self.rid_to_state[rid]
-            if lifecycle_id is not None and state.lifecycle_id != lifecycle_id:
-                return False
             state.abort_requested = True
             parallel_sample_num = getattr(state.obj, "parallel_sample_num", None)
             if parallel_sample_num is None:
@@ -2007,33 +1994,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             if parallel_sample_num > 1:
                 # Snapshot because scheduler abort echoes remove child ownership.
-                target_rids = tuple(
-                    sorted(
-                        child_rid
-                        for child_rid in self.logical_rid_to_child_rids.get(rid, ())
-                        if lifecycle_id is None
-                        or self.rid_to_state.get(child_rid) is not None
-                        and self.rid_to_state[child_rid].lifecycle_id == lifecycle_id
-                    )
-                )
+                target_rids = tuple(sorted(self.logical_rid_to_child_rids.get(rid, ())))
             else:
                 target_rids = (rid,)
         elif child_rids := self.logical_rid_to_child_rids.get(rid):
-            target_rids = tuple(
-                sorted(
-                    child_rid
-                    for child_rid in child_rids
-                    if lifecycle_id is None
-                    or self.rid_to_state.get(child_rid) is not None
-                    and self.rid_to_state[child_rid].lifecycle_id == lifecycle_id
-                )
-            )
-            if lifecycle_id is not None and not target_rids:
-                return False
-        elif lifecycle_id is not None:
-            # Exact-lifecycle aborts must never fall through to the scheduler's
-            # prefix-based RID matching after that lifecycle has completed.
-            return False
+            target_rids = tuple(sorted(child_rids))
         elif self.server_args.tokenizer_worker_num == 1:
             return False
         else:
@@ -3467,7 +3432,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Remove a request state and its parallel-sampling ownership."""
         state = self.rid_to_state.get(rid)
         if state is None or (
-            lifecycle_id is not None and state.lifecycle_id != lifecycle_id
+            lifecycle_id is not None and state.lifecycle_id is not lifecycle_id
         ):
             return None
         self.rid_to_state.pop(rid)
@@ -3587,12 +3552,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for child_rid in self.logical_rid_to_child_rids.get(logical_rid, ())
                 if (
                     (state := self.rid_to_state.get(child_rid)) is not None
-                    and state.lifecycle_id == lifecycle_id
+                    and state.lifecycle_id is lifecycle_id
                 )
             )
             logical_state = self.rid_to_state.get(logical_rid)
             owns_logical_state = (
-                logical_state is not None and logical_state.lifecycle_id == lifecycle_id
+                logical_state is not None and logical_state.lifecycle_id is lifecycle_id
             )
             target_rids = tuple(
                 rid for rid in child_rids if self.rid_to_state[rid].dispatched
